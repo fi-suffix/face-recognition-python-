@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import requests
 import logging
+import queue
 import threading
 import time
 from datetime import datetime
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, HttpUrl
 import uvicorn
 from dotenv import load_dotenv
@@ -31,6 +32,8 @@ FACE_RECOGNITION_THRESHOLD = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.45
 CAMERA_RECONNECT_INTERVAL = int(os.getenv("CAMERA_RECONNECT_INTERVAL", "5"))
 LOG_COOLDOWN = float(os.getenv("LOG_COOLDOWN", "3"))
 RECOGNITION_EVERY_N_FRAMES = int(os.getenv("RECOGNITION_EVERY_N_FRAMES", "2"))
+# Minimum seconds between recognition passes per camera (keeps the video fluid)
+RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "2.0"))
 MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "960"))
 STREAM_FPS = int(os.getenv("STREAM_FPS", "20"))
 
@@ -53,6 +56,10 @@ last_results: Dict[int, tuple] = {}
 embedding_matrix: Optional[np.ndarray] = None  # shape (N, D), rows normalized
 embedding_labels: List[int] = []               # aligned with matrix rows
 last_log: Dict[int, Dict[Any, tuple]] = {}     # camera_id -> fingerprint -> (emp_id, last_log_ts)
+
+# Recognition work (embedding + snapshot + logging) is done off the frame loop
+# so detection/streaming never blocks on the CNN or on Laravel HTTP calls.
+recognition_queue: "queue.Queue" = queue.Queue(maxsize=16)
 
 
 def now_ms() -> float:
@@ -453,7 +460,7 @@ def save_snapshot(camera_id: int, frame: np.ndarray, status: str, timestamp: str
         snapshot_name = f"{dt.strftime('%H-%M-%S-%f')}_{status}.jpg"
         snapshot_path = snapshot_dir / snapshot_name
         cv2.imwrite(str(snapshot_path), frame)
-        return str(snapshot_path)
+        return str(snapshot_path).replace("\\", "/")
     except Exception as e:
         logger.error(f"Failed to save snapshot: {e}")
         return None
@@ -481,11 +488,18 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     except ValueError:
         pass
 
+    # Force TCP transport for RTSP and fail fast instead of hanging 30s per attempt
+    conn_url = rtsp_url
+    if not is_webcam and rtsp_url.startswith("rtsp://"):
+        conn_url = rtsp_url + "?tcp"
+
+    reconnect_interval = camera.reconnect_interval or CAMERA_RECONNECT_INTERVAL
     cap = None
     reconnect_attempts = 0
     max_reconnect_attempts = 10
     frames = 0
     last_scale = 1.0
+    last_recognition = 0.0
 
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
         try:
@@ -499,14 +513,16 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 if is_webcam:
                     cap = cv2.VideoCapture(webcam_index)
                 else:
-                    cap = cv2.VideoCapture(rtsp_url)
+                    cap = cv2.VideoCapture(conn_url)
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
 
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 reconnect_attempts += 1
 
                 if not cap.isOpened():
-                    logger.warning(f"Failed to open camera {camera.id}, retrying in {CAMERA_RECONNECT_INTERVAL}s")
-                    time.sleep(CAMERA_RECONNECT_INTERVAL)
+                    logger.warning(f"Failed to open camera {camera.id}, retrying in {reconnect_interval}s")
+                    time.sleep(reconnect_interval)
                     continue
 
                 reconnect_attempts = 0
@@ -537,7 +553,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
             else:
                 faces = detect_faces_fallback(frame)
 
-            # Run recognition on every Nth frame to reduce CPU load
+            # Run recognition off-thread, time-gated, to keep the video fluid
             run_recognition = (frames % RECOGNITION_EVERY_N_FRAMES == 0)
 
             t = now_ms()
@@ -546,41 +562,30 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 if face_img.size == 0:
                     continue
 
-                if run_recognition:
-                    embedding = extract_face_embedding_sface(face_img)
-                    emp_id, confidence = recognize_face(embedding)
-                    last_results[camera.id] = (x, y, w, h, emp_id, confidence)
-                else:
-                    # Reuse previous recognition result for this face (approx by position)
-                    prev = last_results.get(camera.id)
-                    if prev is None:
-                        continue
-                    px, py, pw, ph, emp_id, confidence = prev
-                    if abs(px - x) > w * 1.5 or abs(py - y) > h * 1.5:
-                        emp_id, confidence = None, 0.0
+                # Reuse the latest recognition result for this face (approx by position)
+                emp_id, confidence = None, 0.0
+                prev = last_results.get(camera.id)
+                if prev is not None:
+                    px, py, pw, ph, prev_emp, prev_conf, prev_ts = prev
+                    if (abs(px - x) <= w * 1.5 and abs(py - y) <= h * 1.5
+                            and (t - prev_ts) < 3.0):
+                        emp_id, confidence = prev_emp, prev_conf
 
-                timestamp = datetime.now().isoformat()
+                # Enqueue recognition (SFace + snapshot + Laravel log) for the worker
+                if run_recognition and (t - last_recognition) >= RECOGNITION_INTERVAL:
+                    try:
+                        recognition_queue.put_nowait((
+                            camera.id, frame.copy(),
+                            int(x), int(y), int(w), int(h), t
+                        ))
+                        last_recognition = t
+                    except queue.Full:
+                        pass
 
+                # Draw bounding box + label immediately (no waiting on the CNN)
                 status = "recognized" if emp_id else "unknown"
                 emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
                 name = emp_data.get("name", "")
-
-                # Logging dedup: limit writes to Laravel DB
-                fp = ("emp", emp_id) if emp_id else ("unk", int(x // 64), int(y // 64))
-                if should_log(camera.id, fp, emp_id, t):
-                    snapshot_path = save_snapshot(camera.id, frame, status, timestamp)
-                    result = FaceRecognitionResult(
-                        camera_id=camera.id,
-                        employee_id=emp_id,
-                        employee_name=name or None,
-                        confidence=float(confidence),
-                        status=status,
-                        timestamp=timestamp,
-                        snapshot_path=snapshot_path
-                    )
-                    send_detection_log(result)
-
-                # Draw bounding box + label
                 color = (0, 255, 0) if status == "recognized" else (0, 0, 255)
                 label = f"{name or 'Unknown'} ({confidence:.2f})"
                 cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
@@ -601,11 +606,53 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
             if cap:
                 cap.release()
                 cap = None
-            time.sleep(CAMERA_RECONNECT_INTERVAL)
+            time.sleep(reconnect_interval)
 
     if cap:
         cap.release()
     logger.info(f"Stopped stream processing for camera {camera.id}")
+
+
+def recognition_worker():
+    """Consumer for recognition_queue: embedding, result cache, snapshot + Laravel log.
+
+    Runs off the camera frame loop so the CNN and HTTP calls never stall the video.
+    """
+    while True:
+        task = recognition_queue.get()
+        if task is None:
+            break
+        camera_id, frame, x, y, w, h, ts = task
+        try:
+            face_img = frame[y:y+h, x:x+w]
+            if face_img.size == 0:
+                continue
+
+            embedding = extract_face_embedding_sface(face_img)
+            emp_id, confidence = recognize_face(embedding)
+            last_results[camera_id] = (x, y, w, h, emp_id, confidence, ts)
+
+            timestamp = datetime.now().isoformat()
+            status = "recognized" if emp_id else "unknown"
+            emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
+            name = emp_data.get("name", "")
+
+            # Logging dedup: limit writes to Laravel DB
+            fp = ("emp", emp_id) if emp_id else ("unk", int(x // 64), int(y // 64))
+            if should_log(camera_id, fp, emp_id, ts):
+                snapshot_path = save_snapshot(camera_id, frame, status, timestamp)
+                result = FaceRecognitionResult(
+                    camera_id=camera_id,
+                    employee_id=emp_id,
+                    employee_name=name or None,
+                    confidence=float(confidence),
+                    status=status,
+                    timestamp=timestamp,
+                    snapshot_path=snapshot_path
+                )
+                send_detection_log(result)
+        except Exception as e:
+            logger.error(f"Recognition worker error for camera {camera_id}: {e}")
 
 
 def start_camera_thread(camera: CameraConfig):
@@ -639,6 +686,10 @@ async def lifespan(app: FastAPI):
     init_face_models()
     load_employee_embeddings()
 
+    # Recognition worker (embedding / snapshot / logging off the frame loop)
+    recognition_thread = threading.Thread(target=recognition_worker, daemon=True)
+    recognition_thread.start()
+
     # Load cameras from Laravel
     try:
         headers = {"Authorization": f"Bearer {LARAVEL_API_KEY}"} if LARAVEL_API_KEY else {}
@@ -658,6 +709,10 @@ async def lifespan(app: FastAPI):
     for cam_id in camera_streams:
         camera_streams[cam_id]["running"] = False
         camera_streams[cam_id].get("stop_event", threading.Event()).set()
+    try:
+        recognition_queue.put_nowait(None)
+    except queue.Full:
+        pass
 
 
 app = FastAPI(
@@ -724,7 +779,7 @@ async def stop_camera(camera_id: int):
 async def camera_stream(camera_id: int):
     """MJPEG stream for live monitoring (serves cached JPEG frames)"""
     if camera_id not in camera_streams:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise HTTPException(status_code=404, detail="Camera not running")
 
     def generate_frames():
         frame_interval = 1.0 / STREAM_FPS
@@ -745,6 +800,23 @@ async def camera_stream(camera_id: int):
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
+
+
+@app.get("/cameras/{camera_id}/snapshot")
+async def camera_snapshot(camera_id: int):
+    """Single JPEG snapshot for polling-based browser playback"""
+    if camera_id not in camera_streams:
+        raise HTTPException(status_code=404, detail="Camera not running")
+    jpg = camera_streams[camera_id].get("latest_jpg")
+    if jpg is None:
+        frame = camera_streams[camera_id].get("latest_frame")
+        if frame is None:
+            raise HTTPException(status_code=503, detail="No frame available")
+        ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if not ok:
+            raise HTTPException(status_code=500, detail="Encode failed")
+        jpg = buffer.tobytes()
+    return Response(content=jpg, media_type="image/jpeg")
 
 
 @app.post("/recognize")
