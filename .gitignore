@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+snapshots/
+test_results/
+models/*.onnx

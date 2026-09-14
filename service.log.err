@@ -1,0 +1,29 @@
+INFO:     Started server process [5380]
+INFO:     Waiting for application startup.
+[ WARN:0@0.591] global net_impl_backend.cpp:345 cv::dnn::dnn5_v20260605::Net::Impl::setPreferableTarget Targets are not supported by the new graph engine for now
+INFO:__main__:YuNet face detector loaded successfully
+[ WARN:0@0.668] global net_impl_backend.cpp:345 cv::dnn::dnn5_v20260605::Net::Impl::setPreferableTarget Targets are not supported by the new graph engine for now
+INFO:__main__:SFace face recognizer loaded successfully
+INFO:__main__:Face detection models initialized
+INFO:__main__:Detected legacy or missing embeddings, recomputing with SFace ...
+INFO:__main__:Embedding recompute finished: 3 recomputed, 1 failed
+INFO:__main__:Embedding matrix rebuilt with 3 samples from 1 employees
+INFO:__main__:Loaded embeddings for 1 employees
+INFO:__main__:Starting stream processing for camera 1: webcam test
+INFO:     Application startup complete.
+INFO:__main__:Connecting to camera 1: 0
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:__main__:Camera 1 connected successfully
+[ WARN:2@601.716] global cap_msmf.cpp:477 `anonymous-namespace'::SourceReaderCB::OnReadSample videoio(MSMF): OnReadSample() is called with error status: -1072873822
+[ WARN:2@601.718] global cap_msmf.cpp:488 `anonymous-namespace'::SourceReaderCB::OnReadSample videoio(MSMF): async ReadSample() call is failed with error status: -1072873822
+[ WARN:1@603.072] global cap_msmf.cpp:1816 CvCapture_MSMF::grabFrame videoio(MSMF): can't grab frame. Error: -1072873822
+WARNING:__main__:Failed to read frame from camera 1
+INFO:__main__:Connecting to camera 1: 0
+INFO:__main__:Camera 1 connected successfully
+ERROR:__main__:Error sending detection log: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)
+[ WARN:2@627.731] global cap_msmf.cpp:477 `anonymous-namespace'::SourceReaderCB::OnReadSample videoio(MSMF): OnReadSample() is called with error status: -1072873822
+[ WARN:2@627.733] global cap_msmf.cpp:488 `anonymous-namespace'::SourceReaderCB::OnReadSample videoio(MSMF): async ReadSample() call is failed with error status: -1072873822
+[ WARN:1@628.471] global cap_msmf.cpp:1816 CvCapture_MSMF::grabFrame videoio(MSMF): can't grab frame. Error: -1072873822
+WARNING:__main__:Failed to read frame from camera 1
+INFO:__main__:Connecting to camera 1: 0
+INFO:__main__:Camera 1 connected successfully
