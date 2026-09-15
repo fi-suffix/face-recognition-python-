@@ -131,3 +131,62 @@ INFO:     Application startup complete.
 INFO:__main__:Connecting to camera 7: rtsp://localhost:8554/live
 INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
 INFO:__main__:Camera 7 connected successfully
+ERROR:__main__:Error sending detection log: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)
+INFO:__main__:Stopped stream processing for camera 7
+INFO:__main__:Starting stream processing for camera 8: webcam test
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+INFO:__main__:Camera 8 connected successfully
+INFO:__main__:Stopped stream processing for camera 8
+INFO:__main__:Starting stream processing for camera 8: webcam test
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+INFO:__main__:Camera 8 connected successfully
+INFO:__main__:Stopped stream processing for camera 8
+INFO:__main__:Starting stream processing for camera 8: webcam test
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+INFO:__main__:Camera 8 connected successfully
+INFO:__main__:Stopped stream processing for camera 8
+ERROR:__main__:Error loading employee embeddings: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=10)
+ERROR:__main__:Error loading employee embeddings: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=10)
+INFO:__main__:Starting stream processing for camera 8: webcam test
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+INFO:__main__:Camera 8 connected successfully
+WARNING:__main__:Failed to read frame from camera 8
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+[h264 @ 0000029f343a6600] Frame num change from 6 to 7
+[h264 @ 0000029f343a6600] decode_slice_header error
+[h264 @ 0000029f343a6600] Frame num change from 6 to 7
+[h264 @ 0000029f343a6600] decode_slice_header error
+[h264 @ 0000029f343a6600] Frame num change from 6 to 7
+[h264 @ 0000029f343a6600] decode_slice_header error
+[h264 @ 0000029f343a6600] Frame num change from 6 to 7
+[h264 @ 0000029f343a6600] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f30d1b700] Frame num change from 0 to 2
+[h264 @ 0000029f30d1b700] decode_slice_header error
+[h264 @ 0000029f323eebc0] corrupted macroblock 4 1 (total_coeff=-1)
+[h264 @ 0000029f323eebc0] error while decoding MB 4 1
+[ WARN:0@9101.795] global cap_ffmpeg_impl.hpp:453 _opencv_ffmpeg_interrupt_callback Stream timeout triggered after 30070.593000 ms
+WARNING:__main__:Failed to open camera 8, retrying in 5s
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+[ WARN:0@9149.500] global cap_ffmpeg_impl.hpp:453 _opencv_ffmpeg_interrupt_callback Stream timeout triggered after 30060.983000 ms
+WARNING:__main__:Failed to open camera 8, retrying in 5s
+INFO:__main__:Stopped stream processing for camera 8
+INFO:__main__:Starting stream processing for camera 8: webcam test
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+[ WARN:1@9198.834] global cap_ffmpeg_impl.hpp:453 _opencv_ffmpeg_interrupt_callback Stream timeout triggered after 30023.537000 ms
+WARNING:__main__:Failed to open camera 8, retrying in 5s
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
+[ WARN:1@9246.300] global cap_ffmpeg_impl.hpp:453 _opencv_ffmpeg_interrupt_callback Stream timeout triggered after 30006.527000 ms
+WARNING:__main__:Failed to open camera 8, retrying in 5s
+INFO:__main__:Connecting to camera 8: rtsp://localhost:8554/live
