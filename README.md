@@ -5,7 +5,7 @@ Layanan backend **face recognition** berbasis **FastAPI + OpenCV DNN**. Bertugas
 - mengambil daftar kamera aktif & embeddings karyawan dari dashboard Laravel (`http://localhost:8000`);
 - membaca stream RTSP (lewat MediaMTX), mendeteksi wajah (**YuNet**), mengenali wajah (**SFace**);
 - menyimpan snapshot hasil deteksi ke folder `snapshots/`;
-- mencatat log deteksi ke Laravel melalui API.
+- mencatat log deteksi ke Laravel melalui API
 
 ## Dependensi
 

@@ -44,6 +44,15 @@ FACE_CROP_MARGIN = float(os.getenv("FACE_CROP_MARGIN", "0.2"))
 # Kotak hasil deteksi terakhir dipakai ulang untuk frame di antaranya.
 DETECTION_EVERY_N_FRAMES = int(os.getenv("DETECTION_EVERY_N_FRAMES", "2"))
 
+# Performance tuning
+DETECT_EVERY_N_FRAMES = int(os.getenv("DETECT_EVERY_N_FRAMES", "3"))  # Run YuNet every N frames
+YUNET_INPUT_WIDTH = int(os.getenv("YUNET_INPUT_WIDTH", "640"))
+YUNET_INPUT_HEIGHT = int(os.getenv("YUNET_INPUT_HEIGHT", "480"))
+YUNET_CONFIDENCE_THRESHOLD = float(os.getenv("YUNET_CONFIDENCE_THRESHOLD", "0.5"))
+RECOGNITION_WORKERS = int(os.getenv("RECOGNITION_WORKERS", "4"))
+RTSP_OPEN_TIMEOUT_MS = int(os.getenv("RTSP_OPEN_TIMEOUT_MS", "10000"))
+RTSP_READ_TIMEOUT_MS = int(os.getenv("RTSP_READ_TIMEOUT_MS", "10000"))
+
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
 YUNET_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
@@ -68,7 +77,11 @@ last_log: Dict[int, Dict[Any, tuple]] = {}     # camera_id -> fingerprint -> (em
 
 # Recognition work (embedding + snapshot + logging) is done off the frame loop
 # so detection/streaming never blocks on the CNN or on Laravel HTTP calls.
-recognition_queue: "queue.Queue" = queue.Queue(maxsize=16)
+recognition_queue: "queue.Queue" = queue.Queue(maxsize=64)  # Increased buffer
+
+# Thread pool for parallel recognition processing
+import concurrent.futures
+recognition_executor = concurrent.futures.ThreadPoolExecutor(max_workers=RECOGNITION_WORKERS)
 
 # YuNet & SFace bukan thread-safe: semua panggilan setInputSize/detect/feature
 # diserial-kan dengan lock ini (dipakai bersamaan oleh tiap thread kamera).
@@ -134,8 +147,11 @@ def init_face_models():
         ensure_models()
 
         if YUNET_PATH.exists():
-            face_detector = cv2.FaceDetectorYN_create(str(YUNET_PATH), "", (320, 320), FACE_DETECTION_CONFIDENCE, 0.3, 5000)
-            logger.info("YuNet face detector loaded successfully")
+            face_detector = cv2.FaceDetectorYN_create(
+                str(YUNET_PATH), "", (YUNET_INPUT_WIDTH, YUNET_INPUT_HEIGHT),
+                YUNET_CONFIDENCE_THRESHOLD, 0.3, 5000
+            )
+            logger.info(f"YuNet face detector loaded successfully (input: {YUNET_INPUT_WIDTH}x{YUNET_INPUT_HEIGHT}, conf: {YUNET_CONFIDENCE_THRESHOLD})")
         else:
             logger.warning("YuNet model not found, using fallback detection")
 
@@ -320,19 +336,13 @@ def detect_faces_yunet(frame: np.ndarray) -> List[tuple]:
         for face in faces:
             x, y, w, h = face[:4].astype(int)
             confidence = face[14]
-            if confidence < FACE_DETECTION_CONFIDENCE:
-                continue
-            if scale > 1.0:
-                x = int(x / scale)
-                y = int(y / scale)
-                w = int(w / scale)
-                h = int(h / scale)
-            x = max(0, x)
-            y = max(0, y)
-            w = min(w, frame.shape[1] - x)
-            h = min(h, frame.shape[0] - y)
-            if w > 8 and h > 8:
-                results.append((x, y, w, h))
+            if confidence > YUNET_CONFIDENCE_THRESHOLD:
+                x = max(0, x)
+                y = max(0, y)
+                w = min(w, frame.shape[1] - x)
+                h = min(h, frame.shape[0] - y)
+                if w > 10 and h > 10:
+                    results.append((x, y, w, h))
     return results
 
 
@@ -549,8 +559,8 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     frames = 0
     last_scale = 1.0
     last_recognition = 0.0
-    read_interval = 1.0 / STREAM_FPS
-    last_read_time = 0.0
+    detect_frame_counter = 0
+    cached_faces = []
 
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
         try:
@@ -565,10 +575,10 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                     cap = cv2.VideoCapture(webcam_index)
                 else:
                     cap = cv2.VideoCapture(conn_url)
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
 
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
                 reconnect_attempts += 1
 
                 if not cap.isOpened():
@@ -597,24 +607,28 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
 
             frames += 1
 
-            # Downscale large frames for cheaper detection + streaming
+            # Downscale large frames for cheaper detection + streaming (tiered)
             h, w = frame.shape[:2]
             if w > MAX_STREAM_WIDTH:
                 last_scale = MAX_STREAM_WIDTH / float(w)
                 new_h = int(h * last_scale)
                 frame = cv2.resize(frame, (MAX_STREAM_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+            elif w > 640:  # Second tier: downscale to 640 for detection
+                last_scale = 640.0 / float(w)
+                new_h = int(h * last_scale)
+                frame = cv2.resize(frame, (640, new_h), interpolation=cv2.INTER_AREA)
             else:
                 last_scale = 1.0
 
-            # Detect faces (hanya tiap DETECTION_EVERY_N_FRAMES, sisanya pakai cache)
-            if frames % DETECTION_EVERY_N_FRAMES == 0:
+            # Detect faces only every DETECT_EVERY_N_FRAMES to reduce CPU load
+            detect_frame_counter += 1
+            if detect_frame_counter >= DETECT_EVERY_N_FRAMES:
+                detect_frame_counter = 0
                 if face_detector is not None:
-                    faces = detect_faces_yunet(frame)
+                    cached_faces = detect_faces_yunet(frame)
                 else:
-                    faces = detect_faces_fallback(frame)
-                last_faces[camera.id] = faces
-            else:
-                faces = last_faces.get(camera.id, [])
+                    cached_faces = detect_faces_fallback(frame)
+            faces = cached_faces
 
             # Run recognition off-thread, time-gated, to keep the video fluid
             run_recognition = (frames % RECOGNITION_EVERY_N_FRAMES == 0)
@@ -643,7 +657,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                         ))
                         last_recognition = t
                     except queue.Full:
-                        pass
+                        logger.warning(f"Recognition queue full for camera {camera.id}, dropping task")
 
                 # Draw bounding box + label immediately (no waiting on the CNN)
                 status = "recognized" if emp_id else "unknown"
@@ -685,37 +699,43 @@ def recognition_worker():
         task = recognition_queue.get()
         if task is None:
             break
-        camera_id, frame, x, y, w, h, ts = task
-        try:
-            face_img = crop_face(frame, x, y, w, h)
-            if face_img.size == 0:
-                continue
+        # Submit to thread pool for parallel processing
+        recognition_executor.submit(process_recognition_task, task)
 
-            embedding = extract_face_embedding_sface(face_img)
-            emp_id, confidence = recognize_face(embedding)
-            last_results[camera_id] = (x, y, w, h, emp_id, confidence, ts)
 
-            timestamp = datetime.now().isoformat()
-            status = "recognized" if emp_id else "unknown"
-            emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
-            name = emp_data.get("name", "")
+def process_recognition_task(task):
+    """Process a single recognition task (runs in thread pool)"""
+    camera_id, frame, x, y, w, h, ts = task
+    try:
+        face_img = frame[y:y+h, x:x+w]
+        if face_img.size == 0:
+            return
 
-            # Logging dedup: limit writes to Laravel DB
-            fp = ("emp", emp_id) if emp_id else ("unk", int(x // 64), int(y // 64))
-            if should_log(camera_id, fp, emp_id, ts):
-                snapshot_path = save_snapshot(camera_id, frame, status, timestamp)
-                result = FaceRecognitionResult(
-                    camera_id=camera_id,
-                    employee_id=emp_id,
-                    employee_name=name or None,
-                    confidence=float(confidence),
-                    status=status,
-                    timestamp=timestamp,
-                    snapshot_path=snapshot_path
-                )
-                send_detection_log(result)
-        except Exception as e:
-            logger.error(f"Recognition worker error for camera {camera_id}: {e}")
+        embedding = extract_face_embedding_sface(face_img)
+        emp_id, confidence = recognize_face(embedding)
+        last_results[camera_id] = (x, y, w, h, emp_id, confidence, ts)
+
+        timestamp = datetime.now().isoformat()
+        status = "recognized" if emp_id else "unknown"
+        emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
+        name = emp_data.get("name", "")
+
+        # Logging dedup: limit writes to Laravel DB
+        fp = ("emp", emp_id) if emp_id else ("unk", int(x // 64), int(y // 64))
+        if should_log(camera_id, fp, emp_id, ts):
+            snapshot_path = save_snapshot(camera_id, frame, status, timestamp)
+            result = FaceRecognitionResult(
+                camera_id=camera_id,
+                employee_id=emp_id,
+                employee_name=name or None,
+                confidence=float(confidence),
+                status=status,
+                timestamp=timestamp,
+                snapshot_path=snapshot_path
+            )
+            send_detection_log(result)
+    except Exception as e:
+        logger.error(f"Recognition worker error for camera {camera_id}: {e}")
 
 
 def start_camera_thread(camera: CameraConfig):
@@ -776,6 +796,8 @@ async def lifespan(app: FastAPI):
         recognition_queue.put_nowait(None)
     except queue.Full:
         pass
+    # Shutdown thread pool
+    recognition_executor.shutdown(wait=True)
 
 
 app = FastAPI(
