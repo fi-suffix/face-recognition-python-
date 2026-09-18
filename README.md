@@ -68,6 +68,9 @@ Copy-Item .env.example .env  # jika ada; atau buat manual dari tabel di bawah
 | `RECOGNITION_INTERVAL` | `2.0` | jeda (detik) antar pass recognition per kamera (membuat video tetap halus) |
 | `MAX_STREAM_WIDTH` | `960` | lebar maksimum video MJPG |
 | `STREAM_FPS` | `20` | target FPS |
+| `FACE_DETECTION_CONFIDENCE` | `0.5` | ambang skor YuNet (rendah = lebih sensitif, wajah kecil/jauh ikut terdeteksi) |
+| `DETECT_UPSCALE` | `1.5` | perbesaran frame sebelum deteksi (`1.0` = mati) — naikkan ke `2.0` untuk kamera tinggi |
+| `FACE_CROP_MARGIN` | `0.2` | margin crop wajah sebelum embedding (pecahan dari ukuran bbox) |
 
 ## Cara menjalankan
 
@@ -122,6 +125,10 @@ Output dan error tertulis ke `service.log` & `service.log.err` (di-ignore git).
 | POST | `/extract-embedding` | upload foto → embedding SFace (multipart) |
 | POST | `/reload-embeddings` | muat ulang embeddings dari Laravel |
 | POST | `/recompute-embeddings` | hitung ulang embeddings (rekomendasi: pakai `models/*.onnx`) |
+| POST | `/test-rtsp` | probe koneksi RTSP untuk tombol "Test Connection" di dashboard (ffmpeg, timeout 12s, tanpa memblokir service) |
+
+> Catatan URL RTSP kamera HVR/Hikvision: path stream utama yang benar biasanya
+> `rtsp://user:pass@ip:554/Streaming/Channels/101` (bukan `A1`).
 
 Integrasi dengan dashboard Laravel terjadi di jalur ini: kamera diaktifkan/dinonaktifkan
 melalui CRUD kamera di dashboard, yang otomatis memanggil `/cameras/{id}/start|stop`.

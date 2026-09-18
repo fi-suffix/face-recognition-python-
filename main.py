@@ -36,6 +36,10 @@ RECOGNITION_EVERY_N_FRAMES = int(os.getenv("RECOGNITION_EVERY_N_FRAMES", "2"))
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "2.0"))
 MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "960"))
 STREAM_FPS = int(os.getenv("STREAM_FPS", "20"))
+# Sensitivitas deteksi wajah (cocok untuk kamera tinggi / wajah kecil)
+FACE_DETECTION_CONFIDENCE = float(os.getenv("FACE_DETECTION_CONFIDENCE", "0.5"))
+DETECT_UPSCALE = float(os.getenv("DETECT_UPSCALE", "1.5"))
+FACE_CROP_MARGIN = float(os.getenv("FACE_CROP_MARGIN", "0.2"))
 
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -60,6 +64,10 @@ last_log: Dict[int, Dict[Any, tuple]] = {}     # camera_id -> fingerprint -> (em
 # Recognition work (embedding + snapshot + logging) is done off the frame loop
 # so detection/streaming never blocks on the CNN or on Laravel HTTP calls.
 recognition_queue: "queue.Queue" = queue.Queue(maxsize=16)
+
+# YuNet & SFace bukan thread-safe: semua panggilan setInputSize/detect/feature
+# diserial-kan dengan lock ini (dipakai bersamaan oleh tiap thread kamera).
+model_lock = threading.Lock()
 
 
 def now_ms() -> float:
@@ -121,7 +129,7 @@ def init_face_models():
         ensure_models()
 
         if YUNET_PATH.exists():
-            face_detector = cv2.FaceDetectorYN_create(str(YUNET_PATH), "", (320, 320), 0.9, 0.3, 5000)
+            face_detector = cv2.FaceDetectorYN_create(str(YUNET_PATH), "", (320, 320), FACE_DETECTION_CONFIDENCE, 0.3, 5000)
             logger.info("YuNet face detector loaded successfully")
         else:
             logger.warning("YuNet model not found, using fallback detection")
@@ -255,7 +263,7 @@ def recompute_embeddings():
                     if w <= 0 or h <= 0:
                         failed += 1
                         continue
-                    face_img = frame[y:y+h, x:x+w]
+                    face_img = crop_face(frame, x, y, w, h)
                     embedding = extract_face_embedding_sface(face_img)
                     upd = requests.put(
                         f"{LARAVEL_API_URL}/face-recognition/employee-photos/{photo['id']}/embedding",
@@ -278,27 +286,62 @@ def recompute_embeddings():
 
 
 def detect_faces_yunet(frame: np.ndarray) -> List[tuple]:
-    """Detect faces using YuNet (OpenCV 5.x)"""
+    """Detect faces using YuNet (OpenCV 5.x).
+
+    Lebih sensitif untuk kamera tinggi / wajah kecil:
+    - ambang skor memakai FACE_DETECTION_CONFIDENCE (.env, default 0.5);
+    - frame diperbesar DETECT_UPSCALE sebelum dideteksi (koordinat dipetakan kembali).
+    """
     if face_detector is None:
         return detect_faces_fallback(frame)
 
-    h, w = frame.shape[:2]
-    face_detector.setInputSize((w, h))
-    _, faces = face_detector.detect(frame)
+    scale = DETECT_UPSCALE
+    det_frame = frame
+    if scale > 1.0:
+        dh, dw = frame.shape[:2]
+        det_frame = cv2.resize(
+            frame,
+            (int(dw * scale), int(dh * scale)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    h, w = det_frame.shape[:2]
+    with model_lock:
+        face_detector.setInputSize((w, h))
+        _, faces = face_detector.detect(det_frame)
 
     results = []
     if faces is not None:
         for face in faces:
             x, y, w, h = face[:4].astype(int)
             confidence = face[14]
-            if confidence > 0.7:
-                x = max(0, x)
-                y = max(0, y)
-                w = min(w, frame.shape[1] - x)
-                h = min(h, frame.shape[0] - y)
-                if w > 10 and h > 10:
-                    results.append((x, y, w, h))
+            if confidence < FACE_DETECTION_CONFIDENCE:
+                continue
+            if scale > 1.0:
+                x = int(x / scale)
+                y = int(y / scale)
+                w = int(w / scale)
+                h = int(h / scale)
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, frame.shape[1] - x)
+            h = min(h, frame.shape[0] - y)
+            if w > 8 and h > 8:
+                results.append((x, y, w, h))
     return results
+
+
+def crop_face(frame: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
+    """Crop wajah dengan margin proporsional (lebih stabil untuk wajah kecil / miring)."""
+    mx = int(w * FACE_CROP_MARGIN)
+    my = int(h * FACE_CROP_MARGIN)
+    x0 = max(0, x - mx)
+    y0 = max(0, y - my)
+    x1 = min(frame.shape[1], x + w + mx)
+    y1 = min(frame.shape[0], y + h + my)
+    if x1 <= x0 or y1 <= y0:
+        return frame[y:y + h, x:x + w]
+    return frame[y0:y1, x0:x1]
 
 
 def detect_faces_fallback(frame: np.ndarray) -> List[tuple]:
@@ -371,7 +414,8 @@ def extract_face_embedding_sface(face_img: np.ndarray) -> np.ndarray:
         return np.array(features, dtype=np.float32)
 
     aligned_face = cv2.resize(face_img, (112, 112))
-    embedding = face_recognizer.feature(aligned_face)
+    with model_lock:
+        embedding = face_recognizer.feature(aligned_face)
     return embedding.flatten()
 
 
@@ -558,7 +602,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
 
             t = now_ms()
             for (x, y, w, h) in faces:
-                face_img = frame[y:y+h, x:x+w]
+                face_img = crop_face(frame, x, y, w, h)
                 if face_img.size == 0:
                     continue
 
@@ -624,7 +668,7 @@ def recognition_worker():
             break
         camera_id, frame, x, y, w, h, ts = task
         try:
-            face_img = frame[y:y+h, x:x+w]
+            face_img = crop_face(frame, x, y, w, h)
             if face_img.size == 0:
                 continue
 
@@ -840,7 +884,7 @@ def recognize_face_endpoint(request: FaceDetectionRequest):
         results = []
         for (x, y, w, h) in faces:
             x, y, w, h = int(x), int(y), int(w), int(h)
-            face_img = frame[y:y+h, x:x+w]
+            face_img = crop_face(frame, x, y, w, h)
             if face_img.size == 0:
                 continue
 
@@ -932,7 +976,7 @@ def extract_embedding_endpoint(file: UploadFile = File(...)):
         # Pick the largest face if multiple are detected
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
         x, y, w, h = int(x), int(y), int(w), int(h)
-        face_img = frame[y:y+h, x:x+w]
+        face_img = crop_face(frame, x, y, w, h)
         embedding = extract_face_embedding_sface(face_img)
 
         return {
@@ -970,6 +1014,89 @@ async def cameras_status():
             "rtsp_url": data["config"].rtsp_url
         }
     return {"cameras": status}
+
+
+class TestRtspRequest(BaseModel):
+    rtsp_url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+@app.post("/test-rtsp")
+def test_rtsp_endpoint(req: TestRtspRequest):
+    """Probe an RTSP camera (dashboard 'Test Connection'). Pakai ffmpeg CLI agar
+    tidak pernah memblokir/menggantung service saat URL tidak terjangkau."""
+    from urllib.parse import quote
+    import shutil
+    import subprocess
+
+    url = req.rtsp_url
+    if url.startswith("rtsp://") and req.username and req.password:
+        user = quote(req.username, safe="")
+        pwd = quote(req.password, safe="")
+        url = url.replace("rtsp://", f"rtsp://{user}:{pwd}@", 1)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        for cand in [r"C:\Users\padil\Downloads\ffmpeg-2026-09-07-git-ecc7eb519e-full_build\bin\ffmpeg.exe"]:
+            if os.path.isfile(cand):
+                ffmpeg = cand
+                break
+
+    if ffmpeg:
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-rtsp_transport", "tcp",
+            "-i", url,
+            "-frames:v", "1",
+            "-f", "null", "-",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            if proc.returncode == 0:
+                return {"success": True, "message": "Koneksi berhasil - stream video aktif"}
+
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            detail = detail[-1] if detail else "koneksi ditolak"
+            return {"success": False, "message": f"Gagal terhubung ({detail[:160]})"}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "message": "Timeout - perangkat tidak merespon dalam 12 detik"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {e}"}
+
+    # Fallback: probe via OpenCV di thread terpisah (tidak memblokir API worker)
+    result_box: dict = {}
+
+    def probe_cv():
+        cap = None
+        try:
+            conn_url = url + ("?tcp" if url.startswith("rtsp://") else "")
+            cap = cv2.VideoCapture(conn_url)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            if not cap.isOpened():
+                result_box["r"] = {"success": False, "message": "Gagal membuka koneksi RTSP"}
+                return
+            ok, frame = cap.read()
+            if not ok:
+                result_box["r"] = {"success": False, "message": "Terkoneksi tapi gagal membaca frame"}
+                return
+            h, w = frame.shape[:2]
+            result_box["r"] = {"success": True, "message": f"Koneksi berhasil - video {w}x{h}", "width": w, "height": h}
+        except Exception as e:
+            result_box["r"] = {"success": False, "message": f"Error: {e}"}
+        finally:
+            if cap is not None:
+                cap.release()
+
+    threading.Thread(target=probe_cv, daemon=True).start()
+    waited = 0.0
+    while "r" not in result_box and waited < 12:
+        time.sleep(0.5)
+        waited += 0.5
+    if "r" in result_box:
+        return result_box["r"]
+    return {"success": False, "message": "Timeout - perangkat tidak merespon dalam 12 detik"}
 
 
 if __name__ == "__main__":
