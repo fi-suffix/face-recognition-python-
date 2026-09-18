@@ -34,12 +34,15 @@ LOG_COOLDOWN = float(os.getenv("LOG_COOLDOWN", "3"))
 RECOGNITION_EVERY_N_FRAMES = int(os.getenv("RECOGNITION_EVERY_N_FRAMES", "2"))
 # Minimum seconds between recognition passes per camera (keeps the video fluid)
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "2.0"))
-MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "960"))
-STREAM_FPS = int(os.getenv("STREAM_FPS", "20"))
+MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "640"))
+STREAM_FPS = int(os.getenv("STREAM_FPS", "10"))
 # Sensitivitas deteksi wajah (cocok untuk kamera tinggi / wajah kecil)
 FACE_DETECTION_CONFIDENCE = float(os.getenv("FACE_DETECTION_CONFIDENCE", "0.5"))
 DETECT_UPSCALE = float(os.getenv("DETECT_UPSCALE", "1.5"))
 FACE_CROP_MARGIN = float(os.getenv("FACE_CROP_MARGIN", "0.2"))
+# Jalankan deteksi YuNet tiap N frame (2 = tiap 2 frame) supaya beban CPU turun.
+# Kotak hasil deteksi terakhir dipakai ulang untuk frame di antaranya.
+DETECTION_EVERY_N_FRAMES = int(os.getenv("DETECTION_EVERY_N_FRAMES", "2"))
 
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -55,6 +58,8 @@ employee_data_cache: Dict[int, Dict] = {}
 
 # Cache of last recognition result per camera (single face approx tracking)
 last_results: Dict[int, tuple] = {}
+# Cache deteksi terakhir per kamera (dipakai ulang pada frame yang dilewati deteksi)
+last_faces: Dict[int, List[tuple]] = {}
 
 # Vectorized matcher state
 embedding_matrix: Optional[np.ndarray] = None  # shape (N, D), rows normalized
@@ -544,6 +549,8 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     frames = 0
     last_scale = 1.0
     last_recognition = 0.0
+    read_interval = 1.0 / STREAM_FPS
+    last_read_time = 0.0
 
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
         try:
@@ -572,7 +579,15 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 reconnect_attempts = 0
                 logger.info(f"Camera {camera.id} connected successfully")
 
+            # Throttle read ke STREAM_FPS agar CPU tidak decode semua frame kamera
+            elapsed = now_ms() - last_read_time
+            wait = read_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+
             ret, frame = cap.read()
+            if ret:
+                last_read_time = now_ms()
             if not ret:
                 logger.warning(f"Failed to read frame from camera {camera.id}")
                 cap.release()
@@ -591,11 +606,15 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
             else:
                 last_scale = 1.0
 
-            # Detect faces
-            if face_detector is not None:
-                faces = detect_faces_yunet(frame)
+            # Detect faces (hanya tiap DETECTION_EVERY_N_FRAMES, sisanya pakai cache)
+            if frames % DETECTION_EVERY_N_FRAMES == 0:
+                if face_detector is not None:
+                    faces = detect_faces_yunet(frame)
+                else:
+                    faces = detect_faces_fallback(frame)
+                last_faces[camera.id] = faces
             else:
-                faces = detect_faces_fallback(frame)
+                faces = last_faces.get(camera.id, [])
 
             # Run recognition off-thread, time-gated, to keep the video fluid
             run_recognition = (frames % RECOGNITION_EVERY_N_FRAMES == 0)
@@ -639,7 +658,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ok:
                 camera_streams[camera.id]["latest_jpg"] = buf.tobytes()
-            camera_streams[camera.id]["latest_frame"] = frame.copy()
+            camera_streams[camera.id]["latest_frame"] = frame
             camera_streams[camera.id]["last_update"] = now_ms()
 
             if frames % 300 == 0:
