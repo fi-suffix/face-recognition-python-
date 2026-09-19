@@ -89,10 +89,6 @@ recognition_executor = concurrent.futures.ThreadPoolExecutor(max_workers=RECOGNI
 # threads + API workers call them concurrently)
 model_lock = threading.Lock()
 
-# YuNet & SFace bukan thread-safe: semua panggilan setInputSize/detect/feature
-# diserial-kan dengan lock ini (dipakai bersamaan oleh tiap thread kamera).
-model_lock = threading.Lock()
-
 
 def now_ms() -> float:
     return datetime.now().timestamp()
@@ -415,19 +411,6 @@ def detect_faces_yunet(frame: np.ndarray) -> List[tuple]:
     return results
 
 
-def crop_face(frame: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
-    """Crop wajah dengan margin proporsional (lebih stabil untuk wajah kecil / miring)."""
-    mx = int(w * FACE_CROP_MARGIN)
-    my = int(h * FACE_CROP_MARGIN)
-    x0 = max(0, x - mx)
-    y0 = max(0, y - my)
-    x1 = min(frame.shape[1], x + w + mx)
-    y1 = min(frame.shape[0], y + h + my)
-    if x1 <= x0 or y1 <= y0:
-        return frame[y:y + h, x:x + w]
-    return frame[y0:y1, x0:x1]
-
-
 def detect_faces_fallback(frame: np.ndarray) -> List[tuple]:
     """Fallback face detection without ONNX models (skin-color + geometry heuristics)"""
     results = []
@@ -696,15 +679,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 reconnect_attempts = 0
                 logger.info(f"Camera {camera.id} connected successfully")
 
-            # Throttle read ke STREAM_FPS agar CPU tidak decode semua frame kamera
-            elapsed = now_ms() - last_read_time
-            wait = read_interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-
             ret, frame = cap.read()
-            if ret:
-                last_read_time = now_ms()
             if not ret:
                 logger.warning(f"Failed to read frame from camera {camera.id}")
                 cap.release()
