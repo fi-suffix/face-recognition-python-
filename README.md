@@ -66,8 +66,19 @@ Copy-Item .env.example .env  # jika ada; atau buat manual dari tabel di bawah
 | `LOG_COOLDOWN` | `3` | jeda (detik) antar log untuk fingerprint yang sama |
 | `RECOGNITION_EVERY_N_FRAMES` | `2` | proses NN setiap N frame |
 | `RECOGNITION_INTERVAL` | `2.0` | jeda (detik) antar pass recognition per kamera (membuat video tetap halus) |
-| `MAX_STREAM_WIDTH` | `960` | lebar maksimum video MJPG |
-| `STREAM_FPS` | `20` | target FPS |
+| `MAX_STREAM_WIDTH` | `640` | lebar maksimum video MJPG (semakin kecil, deteksi+encode makin ringan) |
+| `STREAM_FPS` | `10` | target FPS (jeda frame video) — naikkan bila CPU longgar |
+| `FACE_DETECTION_CONFIDENCE` | `0.5` | ambang skor YuNet (rendah = lebih sensitif, wajah kecil/jauh ikut terdeteksi) |
+| `DETECT_UPSCALE` | `1.5` | perbesaran frame sebelum deteksi (`1.0` = mati) — naikkan ke `2.0` untuk kamera tinggi |
+| `FACE_CROP_MARGIN` | `0.2` | margin crop wajah sebelum embedding (pecahan dari ukuran bbox) |
+| `DETECTION_EVERY_N_FRAMES` | `2` | jalankan deteksi YuNet tiap N frame (menurunkan beban CPU); `1` = setiap frame |
+
+### Tips performa (video delay/lag karena CPU)
+
+- Pengaturan default (`STREAM_FPS=10`, `MAX_STREAM_WIDTH=640`) sudah teruji halus untuk **5 kamera** (load python ± 4–5 core, total CPU ± 60%). Naikkan secara bertahap bila kamera lebih sedikit / CPU kuat.
+- Naikkan `DETECTION_EVERY_N_FRAMES` (3–4) — beban deteksi turun proporsional.
+- Turunkan `DETECT_UPSCALE` ke `1.0`–`1.25`, atau `STREAM_FPS` ke `8`–`10`.
+- Kurangi `MAX_STREAM_WIDTH` ke `480` bila hanya butuh monitoring (bukan verifikasi detail).
 
 ## Cara menjalankan
 
@@ -122,6 +133,10 @@ Output dan error tertulis ke `service.log` & `service.log.err` (di-ignore git).
 | POST | `/extract-embedding` | upload foto → embedding SFace (multipart) |
 | POST | `/reload-embeddings` | muat ulang embeddings dari Laravel |
 | POST | `/recompute-embeddings` | hitung ulang embeddings (rekomendasi: pakai `models/*.onnx`) |
+| POST | `/test-rtsp` | probe koneksi RTSP untuk tombol "Test Connection" di dashboard (ffmpeg, timeout 12s, tanpa memblokir service) |
+
+> Catatan URL RTSP kamera HVR/Hikvision: path stream utama yang benar biasanya
+> `rtsp://user:pass@ip:554/Streaming/Channels/101` (bukan `A1`).
 
 Integrasi dengan dashboard Laravel terjadi di jalur ini: kamera diaktifkan/dinonaktifkan
 melalui CRUD kamera di dashboard, yang otomatis memanggil `/cameras/{id}/start|stop`.
