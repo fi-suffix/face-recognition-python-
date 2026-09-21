@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, HttpUrl
 import uvicorn
 from dotenv import load_dotenv
+import concurrent.futures
 
 load_dotenv()
 
@@ -31,18 +32,31 @@ LARAVEL_API_KEY = os.getenv("LARAVEL_API_KEY", "")
 FACE_RECOGNITION_THRESHOLD = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.45"))
 CAMERA_RECONNECT_INTERVAL = int(os.getenv("CAMERA_RECONNECT_INTERVAL", "5"))
 LOG_COOLDOWN = float(os.getenv("LOG_COOLDOWN", "3"))
-RECOGNITION_EVERY_N_FRAMES = int(os.getenv("RECOGNITION_EVERY_N_FRAMES", "2"))
-# Minimum seconds between recognition passes per camera (keeps the video fluid)
+# Minimum seconds between recognition passes per face track (keeps the video fluid)
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "2.0"))
+# Stream width & fps proven on the field laptop (5 cameras, ~60% CPU)
 MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "640"))
 STREAM_FPS = int(os.getenv("STREAM_FPS", "10"))
-# Sensitivitas deteksi wajah (cocok untuk kamera tinggi / wajah kecil)
-FACE_DETECTION_CONFIDENCE = float(os.getenv("FACE_DETECTION_CONFIDENCE", "0.5"))
+
+# Performance tuning
+DETECTION_INTERVAL = float(os.getenv("DETECTION_INTERVAL", "0.25"))  # seconds between YuNet passes per camera
+DETECT_FRAME_WIDTH = int(os.getenv("DETECT_FRAME_WIDTH", "640"))     # detection runs on a downscaled frame
+# Upscale detection frame to catch small/far faces (1.0 = off); boxes are mapped back
 DETECT_UPSCALE = float(os.getenv("DETECT_UPSCALE", "1.5"))
+# Crop margin ratio applied around the face bbox before embedding
 FACE_CROP_MARGIN = float(os.getenv("FACE_CROP_MARGIN", "0.2"))
-# Jalankan deteksi YuNet tiap N frame (2 = tiap 2 frame) supaya beban CPU turun.
-# Kotak hasil deteksi terakhir dipakai ulang untuk frame di antaranya.
-DETECTION_EVERY_N_FRAMES = int(os.getenv("DETECTION_EVERY_N_FRAMES", "2"))
+LOOP_FPS = int(os.getenv("LOOP_FPS", "15"))                          # target capture-loop FPS per camera
+YUNET_INPUT_WIDTH = int(os.getenv("YUNET_INPUT_WIDTH", "640"))
+YUNET_INPUT_HEIGHT = int(os.getenv("YUNET_INPUT_HEIGHT", "480"))
+# Alias kept for the older FACE_DETECTION_CONFIDENCE var name coming from dashboard/team .env
+YUNET_CONFIDENCE_THRESHOLD = float(os.getenv("FACE_DETECTION_CONFIDENCE", os.getenv("YUNET_CONFIDENCE_THRESHOLD", "0.5")))
+GOOD_FRAME_CONFIDENCE = float(os.getenv("GOOD_FRAME_CONFIDENCE", "0.6"))  # only recognize high-confidence crops
+MIN_FACE_WIDTH = int(os.getenv("MIN_FACE_WIDTH", "20"))              # min face width (in detect-frame px)
+RECOGNITION_WORKERS = int(os.getenv("RECOGNITION_WORKERS", "2"))
+# Recompute ALL stored embeddings with aligned SFace at startup (migration switch)
+RECOMPUTE_EMBEDDINGS_ON_START = (os.getenv("RECOMPUTE_EMBEDDINGS_ON_START", "false").lower() in ("1", "true", "yes"))
+RTSP_OPEN_TIMEOUT_MS = int(os.getenv("RTSP_OPEN_TIMEOUT_MS", "10000"))
+RTSP_READ_TIMEOUT_MS = int(os.getenv("RTSP_READ_TIMEOUT_MS", "10000"))
 
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -56,22 +70,23 @@ camera_streams: Dict[str, Dict] = {}
 face_embeddings_cache: Dict[int, List[np.ndarray]] = {}
 employee_data_cache: Dict[int, Dict] = {}
 
-# Cache of last recognition result per camera (single face approx tracking)
-last_results: Dict[int, tuple] = {}
-# Cache deteksi terakhir per kamera (dipakai ulang pada frame yang dilewati deteksi)
-last_faces: Dict[int, List[tuple]] = {}
-
 # Vectorized matcher state
 embedding_matrix: Optional[np.ndarray] = None  # shape (N, D), rows normalized
 embedding_labels: List[int] = []               # aligned with matrix rows
 last_log: Dict[int, Dict[Any, tuple]] = {}     # camera_id -> fingerprint -> (emp_id, last_log_ts)
 
+# Per-camera face tracks (id continuity for drawing + recognition gating)
+camera_tracks: Dict[int, List[dict]] = {}
+track_lock = threading.Lock()
+
 # Recognition work (embedding + snapshot + logging) is done off the frame loop
 # so detection/streaming never blocks on the CNN or on Laravel HTTP calls.
-recognition_queue: "queue.Queue" = queue.Queue(maxsize=16)
+recognition_queue: "queue.Queue" = queue.Queue(maxsize=64)
 
-# YuNet & SFace bukan thread-safe: semua panggilan setInputSize/detect/feature
-# diserial-kan dengan lock ini (dipakai bersamaan oleh tiap thread kamera).
+# Small thread pool for recognition (kept small so the capture loops keep CPU)
+recognition_executor = concurrent.futures.ThreadPoolExecutor(max_workers=RECOGNITION_WORKERS)
+# Guard for shared cv2 models (YuNet/SFace are NOT thread-safe; multiple camera
+# threads + API workers call them concurrently)
 model_lock = threading.Lock()
 
 
@@ -106,6 +121,12 @@ class FaceRecognitionResult(BaseModel):
     snapshot_path: Optional[str] = None
 
 
+class TestRtspRequest(BaseModel):
+    rtsp_url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
 def ensure_models():
     """Auto-download YuNet & SFace ONNX models from OpenCV Zoo if missing."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,8 +155,11 @@ def init_face_models():
         ensure_models()
 
         if YUNET_PATH.exists():
-            face_detector = cv2.FaceDetectorYN_create(str(YUNET_PATH), "", (320, 320), FACE_DETECTION_CONFIDENCE, 0.3, 5000)
-            logger.info("YuNet face detector loaded successfully")
+            face_detector = cv2.FaceDetectorYN_create(
+                str(YUNET_PATH), "", (YUNET_INPUT_WIDTH, YUNET_INPUT_HEIGHT),
+                YUNET_CONFIDENCE_THRESHOLD, 0.3, 5000
+            )
+            logger.info(f"YuNet face detector loaded successfully (input: {YUNET_INPUT_WIDTH}x{YUNET_INPUT_HEIGHT}, conf: {YUNET_CONFIDENCE_THRESHOLD})")
         else:
             logger.warning("YuNet model not found, using fallback detection")
 
@@ -196,7 +220,8 @@ def load_employee_embeddings():
                     face_embeddings_cache[emp_id] = embeddings
 
             # Migrate legacy (non-SFace) embeddings so recognition stays accurate.
-            if face_recognizer is not None and not RECOMPUTE_EMBEDDINGS_TRIED[0]:
+            needs_check = (RECOMPUTE_EMBEDDINGS_ON_START or face_recognizer is not None) and not RECOMPUTE_EMBEDDINGS_TRIED[0]
+            if needs_check:
                 has_legacy = False
                 for emp in data.get("employees", []):
                     for emb in emp.get("embeddings", []):
@@ -206,10 +231,13 @@ def load_employee_embeddings():
                             break
                     if has_legacy:
                         break
-                if has_legacy:
-                    logger.info("Detected legacy or missing embeddings, recomputing with SFace ...")
+                if has_legacy or RECOMPUTE_EMBEDDINGS_ON_START:
+                    if has_legacy:
+                        logger.info("Detected legacy or missing embeddings, recomputing with SFace ...")
+                    else:
+                        logger.info("RECOMPUTE_EMBEDDINGS_ON_START=true, recomputing embeddings with aligned SFace ...")
                     RECOMPUTE_EMBEDDINGS_TRIED[0] = True
-                    recompute_embeddings()
+                    recompute_embeddings(force=RECOMPUTE_EMBEDDINGS_ON_START)
                     load_employee_embeddings()
                     return
 
@@ -225,11 +253,12 @@ SFACE_DIM = 128
 RECOMPUTE_EMBEDDINGS_TRIED = [False]
 
 
-def recompute_embeddings():
+def recompute_embeddings(force: bool = False):
     """Recompute stored photo embeddings with SFace when they use the old fallback format.
 
     Photos are fetched from the Laravel storage (same machine in dev), re-encoded with
-    SFace, and persisted back via the Laravel API.
+    aligned SFace, and persisted back via the Laravel API. Pass force=True to recompute
+    even embeddings that already have the right dimension (e.g. after an alignment upgrade).
     """
     if face_recognizer is None:
         return {"message": "sface unavailable", "recomputed": 0, "failed": 0}
@@ -247,7 +276,7 @@ def recompute_embeddings():
         for emp in resp.json().get("employees", []):
             for photo in emp.get("embeddings", []):
                 emb = photo.get("embedding") or []
-                if len(emb) == SFACE_DIM:
+                if len(emb) == SFACE_DIM and not force:
                     continue
                 image_path = photo.get("image_path")
                 if not image_path:
@@ -264,12 +293,15 @@ def recompute_embeddings():
                     if not faces:
                         failed += 1
                         continue
-                    x, y, w, h = faces[0]
+                    x, y, w, h, lm, _ = max(faces, key=lambda f: f[2] * f[3])
                     if w <= 0 or h <= 0:
                         failed += 1
                         continue
-                    face_img = crop_face(frame, x, y, w, h)
-                    embedding = extract_face_embedding_sface(face_img)
+                    face_img, lm_rel = crop_face(frame, x, y, w, h, lm)
+                    if face_img is None:
+                        failed += 1
+                        continue
+                    embedding = extract_face_embedding_sface(face_img, lm_rel)
                     upd = requests.put(
                         f"{LARAVEL_API_URL}/face-recognition/employee-photos/{photo['id']}/embedding",
                         json={"embedding": embedding.tolist()},
@@ -289,18 +321,57 @@ def recompute_embeddings():
     logger.info(f"Embedding recompute finished: {recomputed} recomputed, {failed} failed")
     return {"message": "done", "recomputed": recomputed, "failed": failed}
 
+def crop_face(frame: np.ndarray, x: int, y: int, w: int, h: int, lm):
+    """Crop a face with margin (FACE_CROP_MARGIN), returning (crop, landmarks relative to crop)."""
+    mx = max(12, int(w * FACE_CROP_MARGIN))
+    my = max(12, int(h * FACE_CROP_MARGIN))
+    x0 = max(0, x - mx)
+    y0 = max(0, y - my)
+    x1 = min(frame.shape[1], x + w + mx)
+    y1 = min(frame.shape[0], y + h + my)
+    if x1 - x0 < 12 or y1 - y0 < 12:
+        return None, None
+    face_img = frame[y0:y1, x0:x1]
+    if face_img.size == 0:
+        return None, None
+    lm_rel = None
+    if lm is not None:
+        lm_rel = lm - np.array([x0, y0], dtype=np.float32)
+    return face_img, lm_rel
+
+
+def align_face(face_img: np.ndarray, landmarks) -> np.ndarray:
+    """Align the face to the SFace 112x112 template using the 5 YuNet landmarks."""
+    if landmarks is None or len(landmarks) != 5:
+        return face_img
+    src = np.float32(landmarks)
+    tpl = np.float32([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041],
+    ])
+    mat, _ = cv2.estimateAffinePartial2D(src, tpl)
+    if mat is None:
+        return face_img
+    aligned = cv2.warpAffine(face_img, mat, (112, 112), borderValue=0.0)
+    return aligned
+
 
 def detect_faces_yunet(frame: np.ndarray) -> List[tuple]:
     """Detect faces using YuNet (OpenCV 5.x).
 
-    Lebih sensitif untuk kamera tinggi / wajah kecil:
-    - ambang skor memakai FACE_DETECTION_CONFIDENCE (.env, default 0.5);
-    - frame diperbesar DETECT_UPSCALE sebelum dideteksi (koordinat dipetakan kembali).
+    Supports DETECT_UPSCALE: the frame is enlarged before detection to catch
+    small/far faces; bounding boxes & landmarks are mapped back to the space of
+    the input `frame`. Shared model access is guarded by model_lock.
+
+    Returns list of (x, y, w, h, landmarks(5x2 float32 or None), confidence).
     """
     if face_detector is None:
         return detect_faces_fallback(frame)
 
-    scale = DETECT_UPSCALE
+    scale = DETECT_UPSCALE if DETECT_UPSCALE > 1.0 else 1.0
     det_frame = frame
     if scale > 1.0:
         dh, dw = frame.shape[:2]
@@ -319,34 +390,25 @@ def detect_faces_yunet(frame: np.ndarray) -> List[tuple]:
     if faces is not None:
         for face in faces:
             x, y, w, h = face[:4].astype(int)
-            confidence = face[14]
-            if confidence < FACE_DETECTION_CONFIDENCE:
-                continue
-            if scale > 1.0:
-                x = int(x / scale)
-                y = int(y / scale)
-                w = int(w / scale)
-                h = int(h / scale)
-            x = max(0, x)
-            y = max(0, y)
-            w = min(w, frame.shape[1] - x)
-            h = min(h, frame.shape[0] - y)
-            if w > 8 and h > 8:
-                results.append((x, y, w, h))
+            confidence = float(face[14])
+            if confidence > YUNET_CONFIDENCE_THRESHOLD:
+                lm = None
+                if face.shape[0] >= 14:
+                    lm = face[4:14].reshape(5, 2).astype(np.float32)
+                if scale > 1.0:
+                    x = int(round(x / scale))
+                    y = int(round(y / scale))
+                    w = int(round(w / scale))
+                    h = int(round(h / scale))
+                    if lm is not None:
+                        lm = lm / scale
+                x = max(0, x)
+                y = max(0, y)
+                w = min(w, frame.shape[1] - x)
+                h = min(h, frame.shape[0] - y)
+                if w > MIN_FACE_WIDTH and h > 10:
+                    results.append((x, y, w, h, lm, confidence))
     return results
-
-
-def crop_face(frame: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
-    """Crop wajah dengan margin proporsional (lebih stabil untuk wajah kecil / miring)."""
-    mx = int(w * FACE_CROP_MARGIN)
-    my = int(h * FACE_CROP_MARGIN)
-    x0 = max(0, x - mx)
-    y0 = max(0, y - my)
-    x1 = min(frame.shape[1], x + w + mx)
-    y1 = min(frame.shape[0], y + h + my)
-    if x1 <= x0 or y1 <= y0:
-        return frame[y:y + h, x:x + w]
-    return frame[y0:y1, x0:x1]
 
 
 def detect_faces_fallback(frame: np.ndarray) -> List[tuple]:
@@ -397,11 +459,11 @@ def detect_faces_fallback(frame: np.ndarray) -> List[tuple]:
         if keep:
             kept.append((x, y, w, h))
 
-    return kept
+    return [(x, y, w, h, None, None) for (x, y, w, h) in kept]
 
 
-def extract_face_embedding_sface(face_img: np.ndarray) -> np.ndarray:
-    """Extract face embedding using SFace (OpenCV 5.x)"""
+def extract_face_embedding_sface(face_img: np.ndarray, landmarks=None) -> np.ndarray:
+    """Extract face embedding using SFace (OpenCV 5.x), aligned via landmarks."""
     if face_recognizer is None:
         gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (100, 100))
@@ -418,9 +480,9 @@ def extract_face_embedding_sface(face_img: np.ndarray) -> np.ndarray:
         features.extend([float(np.mean(lap)), float(np.std(lap))])
         return np.array(features, dtype=np.float32)
 
-    aligned_face = cv2.resize(face_img, (112, 112))
-    with model_lock:
-        embedding = face_recognizer.feature(aligned_face)
+    aligned_face = align_face(face_img, landmarks)
+    aligned_face = cv2.resize(aligned_face, (112, 112))
+    embedding = face_recognizer.feature(aligned_face)
     return embedding.flatten()
 
 
@@ -525,8 +587,45 @@ def build_rtsp_url(camera: CameraConfig) -> str:
     return camera.rtsp_url
 
 
+def match_track(tracks: List[dict], bbox: tuple, t: float, max_age_ms: float = 3000.0) -> tuple:
+    """Find the tracked face whose box overlaps the new detection by IoU."""
+    bx, by, bw, bh = bbox
+    best_iou = 0.0
+    best_i = None
+    for i, tr in enumerate(tracks):
+        if t - tr.get("ts", 0.0) > max_age_ms:
+            continue
+        tx, ty, tw, th = tr.get("bbox", (0, 0, 0, 0))
+        xi1 = max(bx, tx)
+        yi1 = max(by, ty)
+        xi2 = min(bx + bw, tx + tw)
+        yi2 = min(by + bh, ty + th)
+        inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+        union = bw * bh + tw * th - inter
+        iou = inter / union if union > 0 else 0
+        if iou > best_iou:
+            best_iou = iou
+            best_i = i
+    return best_i, best_iou
+
+
+def prune_tracks(camera_id: int, t: float, max_age_ms: float = 5000.0, max_items: int = 80):
+    tracks = camera_tracks.get(camera_id, [])
+    if not tracks:
+        return
+    alive = [tr for tr in tracks if t - tr.get("ts", 0.0) <= max_age_ms]
+    if len(alive) > max_items:
+        alive = alive[-max_items:]
+    camera_tracks[camera_id] = alive
+
 def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
-    """Process camera stream in background"""
+    """Process camera stream in background.
+
+    The capture loop reads + downscales + encodes frames at a capped fps. Face
+    detection runs time-gated on a small frame, and recognition (SFace + snapshot
+    + Laravel log) is off-loaded to the worker pool. Nothing here copies the full
+    frame per detected face, so a walking person no longer starves the loop.
+    """
     logger.info(f"Starting stream processing for camera {camera.id}: {camera.name}")
 
     rtsp_url = build_rtsp_url(camera)
@@ -547,12 +646,13 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     reconnect_attempts = 0
     max_reconnect_attempts = 10
     frames = 0
-    last_scale = 1.0
-    last_recognition = 0.0
-    read_interval = 1.0 / STREAM_FPS
-    last_read_time = 0.0
+    loop_dt = 1.0 / max(1, LOOP_FPS)
+    last_detect_ts = 0.0
+    cached_faces = []
+    det_frame = None
 
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
+        loop_start = time.time()
         try:
             if cap is None or not cap.isOpened():
                 if reconnect_attempts >= max_reconnect_attempts:
@@ -565,10 +665,10 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                     cap = cv2.VideoCapture(webcam_index)
                 else:
                     cap = cv2.VideoCapture(conn_url)
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
 
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
                 reconnect_attempts += 1
 
                 if not cap.isOpened():
@@ -579,15 +679,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 reconnect_attempts = 0
                 logger.info(f"Camera {camera.id} connected successfully")
 
-            # Throttle read ke STREAM_FPS agar CPU tidak decode semua frame kamera
-            elapsed = now_ms() - last_read_time
-            wait = read_interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-
             ret, frame = cap.read()
-            if ret:
-                last_read_time = now_ms()
             if not ret:
                 logger.warning(f"Failed to read frame from camera {camera.id}")
                 cap.release()
@@ -597,72 +689,94 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
 
             frames += 1
 
-            # Downscale large frames for cheaper detection + streaming
+            # Downscale large frames for cheaper streaming (tiered)
             h, w = frame.shape[:2]
             if w > MAX_STREAM_WIDTH:
-                last_scale = MAX_STREAM_WIDTH / float(w)
-                new_h = int(h * last_scale)
+                scale = MAX_STREAM_WIDTH / float(w)
+                new_h = int(h * scale)
                 frame = cv2.resize(frame, (MAX_STREAM_WIDTH, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                last_scale = 1.0
-
-            # Detect faces (hanya tiap DETECTION_EVERY_N_FRAMES, sisanya pakai cache)
-            if frames % DETECTION_EVERY_N_FRAMES == 0:
-                if face_detector is not None:
-                    faces = detect_faces_yunet(frame)
-                else:
-                    faces = detect_faces_fallback(frame)
-                last_faces[camera.id] = faces
-            else:
-                faces = last_faces.get(camera.id, [])
-
-            # Run recognition off-thread, time-gated, to keep the video fluid
-            run_recognition = (frames % RECOGNITION_EVERY_N_FRAMES == 0)
+            elif w > 640:
+                scale = 640.0 / float(w)
+                new_h = int(h * scale)
+                frame = cv2.resize(frame, (640, new_h), interpolation=cv2.INTER_AREA)
 
             t = now_ms()
-            for (x, y, w, h) in faces:
-                face_img = crop_face(frame, x, y, w, h)
-                if face_img.size == 0:
-                    continue
 
-                # Reuse the latest recognition result for this face (approx by position)
-                emp_id, confidence = None, 0.0
-                prev = last_results.get(camera.id)
-                if prev is not None:
-                    px, py, pw, ph, prev_emp, prev_conf, prev_ts = prev
-                    if (abs(px - x) <= w * 1.5 and abs(py - y) <= h * 1.5
-                            and (t - prev_ts) < 3.0):
-                        emp_id, confidence = prev_emp, prev_conf
+            # Detection is time-gated (not frame-gated) and runs on a small frame
+            if (t - last_detect_ts) >= (DETECTION_INTERVAL * 1000.0):
+                last_detect_ts = t
+                th, tw = frame.shape[:2]
+                det_frame = frame
+                if tw > DETECT_FRAME_WIDTH:
+                    dscale = DETECT_FRAME_WIDTH / float(tw)
+                    det_frame = cv2.resize(frame, (DETECT_FRAME_WIDTH, int(th * dscale)), interpolation=cv2.INTER_AREA)
+                if face_detector is not None:
+                    cached_faces = detect_faces_yunet(det_frame)
+                else:
+                    cached_faces = detect_faces_fallback(det_frame)
 
-                # Enqueue recognition (SFace + snapshot + Laravel log) for the worker
-                if run_recognition and (t - last_recognition) >= RECOGNITION_INTERVAL:
-                    try:
-                        recognition_queue.put_nowait((
-                            camera.id, frame.copy(),
-                            int(x), int(y), int(w), int(h), t
-                        ))
-                        last_recognition = t
-                    except queue.Full:
-                        pass
+            faces = cached_faces if cached_faces else []
+            disp_scale = 1.0
+            if det_frame is not None and det_frame is not frame:
+                disp_scale = frame.shape[1] / float(det_frame.shape[1])
 
-                # Draw bounding box + label immediately (no waiting on the CNN)
-                status = "recognized" if emp_id else "unknown"
+            tracks = camera_tracks.setdefault(camera.id, [])
+            frames_due = []
+
+            for (x, y, w, h, lm, fconf) in faces:
+                good = (fconf is None or fconf >= GOOD_FRAME_CONFIDENCE)
+                idx, _ = match_track(tracks, (x, y, w, h), t)
+                if idx is not None:
+                    tr = tracks[idx]
+                    tr["bbox"] = (x, y, w, h)
+                    tr["ts"] = t
+                    emp_id = tr.get("emp_id")
+                    confidence = tr.get("confidence", 0.0)
+                    recognize_now = good and w >= MIN_FACE_WIDTH and (
+                        t - tr.get("last_recog_ts", 0.0)) >= (RECOGNITION_INTERVAL * 1000.0)
+                else:
+                    emp_id = None
+                    confidence = 0.0
+                    tr = {"bbox": (x, y, w, h), "ts": t, "emp_id": None, "confidence": 0.0, "last_recog_ts": 0.0}
+                    with track_lock:
+                        tracks.append(tr)
+                    recognize_now = good and w >= MIN_FACE_WIDTH
+
+                if recognize_now:
+                    frames_due.append((x, y, w, h, lm, fconf, t))
+                    tr["last_recog_ts"] = t
+
+                dx, dy = int(x * disp_scale), int(y * disp_scale)
+                dw, dh = int(w * disp_scale), int(h * disp_scale)
                 emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
                 name = emp_data.get("name", "")
+                status = "recognized" if emp_id else "unknown"
                 color = (0, 255, 0) if status == "recognized" else (0, 0, 255)
                 label = f"{name or 'Unknown'} ({confidence:.2f})"
-                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(frame, label, (x, max(20, y-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), color, 2)
+                cv2.putText(frame, label, (dx, max(20, dy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Store cached JPEG for MJPEG streaming (encode once, serve many clients)
+            # Off-load recognition (SFace + snapshot + Laravel log) to the workers.
+            # Only the small detection frame is copied, once per detection pass.
+            if frames_due and face_recognizer is not None:
+                try:
+                    recognition_queue.put_nowait((camera.id, det_frame.copy(), frames_due))
+                except queue.Full:
+                    logger.warning(f"Recognition queue full for camera {camera.id}, dropping batch")
+
+            # Store cached JPEG for MJPEG streaming / snapshot polling
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ok:
                 camera_streams[camera.id]["latest_jpg"] = buf.tobytes()
-            camera_streams[camera.id]["latest_frame"] = frame
             camera_streams[camera.id]["last_update"] = now_ms()
 
-            if frames % 300 == 0:
+            if frames % 200 == 0:
                 prune_last_log()
+                prune_tracks(camera.id, now_ms())
+
+            elapsed = time.time() - loop_start
+            if elapsed < loop_dt:
+                time.sleep(loop_dt - elapsed)
 
         except Exception as e:
             logger.error(f"Error processing camera {camera.id}: {e}")
@@ -685,25 +799,39 @@ def recognition_worker():
         task = recognition_queue.get()
         if task is None:
             break
-        camera_id, frame, x, y, w, h, ts = task
-        try:
-            face_img = crop_face(frame, x, y, w, h)
-            if face_img.size == 0:
+        recognition_executor.submit(process_recognition_task, task)
+
+
+def process_recognition_task(task):
+    """Process a recognition batch (frame + list of faces) in the thread pool."""
+    camera_id, det_frame, faces = task
+    t = now_ms()
+    try:
+        timestamp = datetime.now().isoformat()
+        for (x, y, w, h, lm, fconf, ts) in faces:
+            face_img, lm_rel = crop_face(det_frame, x, y, w, h, lm)
+            if face_img is None:
                 continue
 
-            embedding = extract_face_embedding_sface(face_img)
+            embedding = extract_face_embedding_sface(face_img, lm_rel)
             emp_id, confidence = recognize_face(embedding)
-            last_results[camera_id] = (x, y, w, h, emp_id, confidence, ts)
 
-            timestamp = datetime.now().isoformat()
+            with track_lock:
+                tr = camera_tracks.get(camera_id)
+                if tr is not None:
+                    idx, _ = match_track(tr, (x, y, w, h), t)
+                    if idx is not None and tr[idx].get("last_recog_ts", -1e9) <= ts:
+                        tr[idx]["emp_id"] = emp_id
+                        tr[idx]["confidence"] = confidence
+
             status = "recognized" if emp_id else "unknown"
             emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
             name = emp_data.get("name", "")
 
             # Logging dedup: limit writes to Laravel DB
             fp = ("emp", emp_id) if emp_id else ("unk", int(x // 64), int(y // 64))
-            if should_log(camera_id, fp, emp_id, ts):
-                snapshot_path = save_snapshot(camera_id, frame, status, timestamp)
+            if should_log(camera_id, fp, emp_id, t):
+                snapshot_path = save_snapshot(camera_id, det_frame, status, timestamp)
                 result = FaceRecognitionResult(
                     camera_id=camera_id,
                     employee_id=emp_id,
@@ -714,8 +842,8 @@ def recognition_worker():
                     snapshot_path=snapshot_path
                 )
                 send_detection_log(result)
-        except Exception as e:
-            logger.error(f"Recognition worker error for camera {camera_id}: {e}")
+    except Exception as e:
+        logger.error(f"Recognition worker error for camera {camera_id}: {e}")
 
 
 def start_camera_thread(camera: CameraConfig):
@@ -734,7 +862,6 @@ def start_camera_thread(camera: CameraConfig):
         "running": True,
         "stop_event": stop_event,
         "latest_jpg": None,
-        "latest_frame": None,
         "last_update": None,
     }
     thread = threading.Thread(target=process_camera_stream, args=(camera, stop_event), daemon=True)
@@ -776,12 +903,14 @@ async def lifespan(app: FastAPI):
         recognition_queue.put_nowait(None)
     except queue.Full:
         pass
+    # Shutdown thread pool
+    recognition_executor.shutdown(wait=True)
 
 
 app = FastAPI(
     title="Facial Recognition CCTV Service",
     description="Computer Vision service for face detection and recognition",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -848,12 +977,6 @@ async def camera_stream(camera_id: int):
         frame_interval = 1.0 / STREAM_FPS
         while camera_streams.get(camera_id, {}).get("running", False):
             jpg = camera_streams[camera_id].get("latest_jpg")
-            if jpg is None:
-                frame = camera_streams[camera_id].get("latest_frame")
-                if frame is not None:
-                    ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                    if ok:
-                        jpg = buffer.tobytes()
             if jpg is not None:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n')
@@ -872,13 +995,7 @@ async def camera_snapshot(camera_id: int):
         raise HTTPException(status_code=404, detail="Camera not running")
     jpg = camera_streams[camera_id].get("latest_jpg")
     if jpg is None:
-        frame = camera_streams[camera_id].get("latest_frame")
-        if frame is None:
-            raise HTTPException(status_code=503, detail="No frame available")
-        ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if not ok:
-            raise HTTPException(status_code=500, detail="Encode failed")
-        jpg = buffer.tobytes()
+        raise HTTPException(status_code=503, detail="No frame available")
     return Response(content=jpg, media_type="image/jpeg")
 
 
@@ -901,13 +1018,13 @@ def recognize_face_endpoint(request: FaceDetectionRequest):
             faces = detect_faces_fallback(frame)
 
         results = []
-        for (x, y, w, h) in faces:
+        for (x, y, w, h, lm, _) in faces:
             x, y, w, h = int(x), int(y), int(w), int(h)
-            face_img = crop_face(frame, x, y, w, h)
-            if face_img.size == 0:
+            face_img, lm_rel = crop_face(frame, x, y, w, h, lm)
+            if face_img is None:
                 continue
 
-            embedding = extract_face_embedding_sface(face_img)
+            embedding = extract_face_embedding_sface(face_img, lm_rel)
             emp_id, confidence = recognize_face(embedding)
 
             if emp_id:
@@ -937,8 +1054,6 @@ def recognize_face_endpoint(request: FaceDetectionRequest):
 @app.post("/test-detect")
 def test_detect_endpoint(file: UploadFile = File(...)):
     """Test face detection from uploaded image file"""
-    import base64
-
     try:
         contents = file.file.read()
         nparr = np.frombuffer(contents, np.uint8)
@@ -952,7 +1067,7 @@ def test_detect_endpoint(file: UploadFile = File(...)):
         else:
             faces = detect_faces_fallback(frame)
 
-        for (x, y, w, h) in faces:
+        for (x, y, w, h, lm, _) in faces:
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
             cv2.putText(frame, "FACE", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
@@ -962,7 +1077,7 @@ def test_detect_endpoint(file: UploadFile = File(...)):
 
         return {
             "faces_detected": len(faces),
-            "faces": [{"bbox": [int(x), int(y), int(w), int(h)]} for (x, y, w, h) in faces],
+            "faces": [{"bbox": [int(x), int(y), int(w), int(h)]} for (x, y, w, h, _, _) in faces],
             "annotated_image": str(output_path),
             "model": "yunet" if face_detector is not None else "fallback"
         }
@@ -974,8 +1089,6 @@ def test_detect_endpoint(file: UploadFile = File(...)):
 @app.post("/extract-embedding")
 def extract_embedding_endpoint(file: UploadFile = File(...)):
     """Extract embedding from uploaded face image"""
-    import base64
-
     try:
         contents = file.file.read()
         nparr = np.frombuffer(contents, np.uint8)
@@ -993,10 +1106,12 @@ def extract_embedding_endpoint(file: UploadFile = File(...)):
             return {"embedding": None, "faces_detected": 0}
 
         # Pick the largest face if multiple are detected
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        x, y, w, h, lm, _ = max(faces, key=lambda f: f[2] * f[3])
         x, y, w, h = int(x), int(y), int(w), int(h)
-        face_img = crop_face(frame, x, y, w, h)
-        embedding = extract_face_embedding_sface(face_img)
+        face_img, lm_rel = crop_face(frame, x, y, w, h, lm)
+        if face_img is None:
+            return {"embedding": None, "faces_detected": 0}
+        embedding = extract_face_embedding_sface(face_img, lm_rel)
 
         return {
             "embedding": embedding.tolist(),
@@ -1016,9 +1131,9 @@ async def reload_embeddings():
 
 
 @app.post("/recompute-embeddings")
-async def recompute_embeddings_endpoint():
-    """Recompute stored embeddings using SFace (migrates legacy histogram features)."""
-    result = recompute_embeddings()
+async def recompute_embeddings_endpoint(force: bool = True):
+    """Recompute stored embeddings using aligned SFace (migrates old embeddings)."""
+    result = recompute_embeddings(force=force)
     load_employee_embeddings()
     return result
 
@@ -1033,12 +1148,6 @@ async def cameras_status():
             "rtsp_url": data["config"].rtsp_url
         }
     return {"cameras": status}
-
-
-class TestRtspRequest(BaseModel):
-    rtsp_url: str
-    username: Optional[str] = None
-    password: Optional[str] = None
 
 
 @app.post("/test-rtsp")
