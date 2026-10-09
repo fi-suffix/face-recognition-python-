@@ -68,15 +68,20 @@ Copy-Item .env.example .env  # jika ada; atau buat manual dari tabel di bawah
 | `RECOGNITION_INTERVAL` | `2.0` | jeda (detik) antar pass recognition per kamera (membuat video tetap halus) |
 | `MAX_STREAM_WIDTH` | `640` | lebar maksimum video MJPG (semakin kecil, deteksi+encode makin ringan) |
 | `STREAM_FPS` | `10` | target FPS (jeda frame video) — naikkan bila CPU longgar |
-| `FACE_DETECTION_CONFIDENCE` | `0.5` | ambang skor YuNet (rendah = lebih sensitif, wajah kecil/jauh ikut terdeteksi) |
 | `DETECT_UPSCALE` | `1.5` | perbesaran frame sebelum deteksi (`1.0` = mati) — naikkan ke `2.0` untuk kamera tinggi |
 | `FACE_CROP_MARGIN` | `0.2` | margin crop wajah sebelum embedding (pecahan dari ukuran bbox) |
-| `DETECTION_EVERY_N_FRAMES` | `2` | jalankan deteksi YuNet tiap N frame (menurunkan beban CPU); `1` = setiap frame |
+| `DETECT_EVERY_N_FRAMES` | `2` | jalankan deteksi YuNet tiap N frame (menurunkan beban CPU); `1` = setiap frame |
+| `DETECT_ENHANCE` | `1` | CLAHE pada frame deteksi untuk video burik/low-light |
+| `MIN_FACE_SIZE` | `24` | wajah < nilai ini (px, skala lebar stream) tidak di-recognisi/di-log (buang noise) |
+| `RECOGNITION_MAX_FACES` | `2` | maks wajah terbesar per jendela recognition (kontrol burst saat ramai) |
+| `RECOGNITION_WORKERS` | `2` | thread recognition (SFace+HTTP+snapshot) |
+| `YUNET_CONFIDENCE_THRESHOLD` | `0.5` | ambang skor YuNet (rendah = lebih sensitif, wajah kecil/jauh ikut terdeteksi) |
+| `YUNET_INPUT_WIDTH` / `YUNET_INPUT_HEIGHT` | `640` / `480` | ukuran input awal YuNet (otomatis menyesuaikan ukuran frame saat deteksi) |
 
 ### Tips performa (video delay/lag karena CPU)
 
 - Pengaturan default (`STREAM_FPS=10`, `MAX_STREAM_WIDTH=640`) sudah teruji halus untuk **5 kamera** (load python ± 4–5 core, total CPU ± 60%). Naikkan secara bertahap bila kamera lebih sedikit / CPU kuat.
-- Naikkan `DETECTION_EVERY_N_FRAMES` (3–4) — beban deteksi turun proporsional.
+- Naikkan `DETECT_EVERY_N_FRAMES` (3–4) — beban deteksi turun proporsional.
 - Turunkan `DETECT_UPSCALE` ke `1.0`–`1.25`, atau `STREAM_FPS` ke `8`–`10`.
 - Kurangi `MAX_STREAM_WIDTH` ke `480` bila hanya butuh monitoring (bukan verifikasi detail).
 
