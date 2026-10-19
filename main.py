@@ -89,10 +89,12 @@ TRACK_MAX_AGE = float(os.getenv("TRACK_MAX_AGE", "2.0"))
 
 # --- Fall Detection Configuration ---
 FALL_DETECTION_ENABLED = os.getenv("FALL_DETECTION_ENABLED", "1") == "1"
-FALL_DETECTION_INTERVAL = float(os.getenv("FALL_DETECTION_INTERVAL", "1.0"))
-FALL_ANGLE_THRESHOLD = float(os.getenv("FALL_ANGLE_THRESHOLD", "45"))
-FALL_DURATION_THRESHOLD = float(os.getenv("FALL_DURATION_THRESHOLD", "3.0"))
-FALL_CONFIDENCE_THRESHOLD = float(os.getenv("FALL_CONFIDENCE_THRESHOLD", "0.5"))
+FALL_DETECTION_INTERVAL = float(os.getenv("FALL_DETECTION_INTERVAL", "0.3"))  # was 1.0, now 0.3s for faster detection
+FALL_ANGLE_THRESHOLD = float(os.getenv("FALL_ANGLE_THRESHOLD", "60"))       # was 45, widened to 60 for sitting+lying
+FALL_DURATION_THRESHOLD = float(os.getenv("FALL_DURATION_THRESHOLD", "1.5")) # was 3.0, now 1.5s
+FALL_CONFIDENCE_THRESHOLD = float(os.getenv("FALL_CONFIDENCE_THRESHOLD", "0.45"))
+FALL_DESCENT_VELOCITY = float(os.getenv("FALL_DESCENT_VELOCITY", "0.08"))  # NEW: normalized velocity threshold
+FALL_MIN_PERSON_HEIGHT = float(os.getenv("FALL_MIN_PERSON_HEIGHT", "0.12")) # NEW: min person height in frame
 ALERT_SOUND_ENABLED = os.getenv("ALERT_SOUND_ENABLED", "1") == "1"
 ALERT_SOUND_PATH = os.getenv("ALERT_SOUND_PATH", "")
 ALERT_REPEAT_COUNT = int(os.getenv("ALERT_REPEAT_COUNT", "3"))
@@ -100,6 +102,7 @@ ALERT_REPEAT_COUNT = int(os.getenv("ALERT_REPEAT_COUNT", "3"))
 # Import fall detection modules
 from fall_detector import FallDetector, FallState
 from alert_sound import play_emergency_alert
+from playback_service import playback_router
 
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -604,7 +607,11 @@ def build_rtsp_url(camera: CameraConfig) -> str:
 
 
 def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
-    """Process camera stream in background"""
+    """Process camera stream in background (video-only, no face recognition).
+
+    Also runs fall detection via the shared global fall_detector so non-recognition
+    cameras still get fall alerts.
+    """
     logger.info(f"Starting stream processing for camera {camera.id}: {camera.name}")
 
     rtsp_url = build_rtsp_url(camera)
@@ -632,6 +639,11 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     cached_faces = []
     read_interval = 1.0 / STREAM_FPS
     last_read_time = 0.0
+
+    # Fall detection timing for non-recognition cameras
+    last_fall_check = 0.0
+    fall_check_interval = FALL_DETECTION_INTERVAL
+    cam_fall_cooldown = 0.0
 
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
         try:
@@ -763,6 +775,35 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 camera_streams[camera.id]["latest_jpg"] = buf.tobytes()
             camera_streams[camera.id]["latest_frame"] = frame
             camera_streams[camera.id]["last_update"] = now_ms()
+
+            # --- Fall Detection for non-recognition cameras ---
+            # Run pose estimation at FALL_DETECTION_INTERVAL to avoid CPU overload
+            if FALL_DETECTION_ENABLED and fall_detector is not None:
+                now_fall = time.perf_counter()
+                if (now_fall - last_fall_check) >= fall_check_interval:
+                    last_fall_check = now_fall
+                    if (now_fall - cam_fall_cooldown) >= FALL_ALERT_COOLDOWN_SECONDS:
+                        try:
+                            h, w = frame.shape[:2]
+                            landmarks = fall_detector.detect_pose(frame)
+                            if landmarks is not None:
+                                events = fall_detector.update(landmarks, h, w, timestamp=now_fall)
+                                for event in events:
+                                    event_type = event.get("type", "")
+                                    if event_type in ("fall", "fall_warning"):
+                                        severity = event.get("severity", "critical")
+                                        logger.warning(
+                                            f"[FALL][{severity.upper()}] Camera {camera.id}: "
+                                            f"type={event_type} angle={event.get('body_angle', 0)}° "
+                                            f"vel_y={event.get('velocity_y', 0)} "
+                                            f"dur={event.get('fallen_duration', 0)}s "
+                                            f"confidence={event.get('confidence', 0)}"
+                                        )
+                                        _emit_emergency_event(camera.id, frame, event)
+                                        if event_type == "fall":
+                                            cam_fall_cooldown = now_fall
+                        except Exception as e:
+                            logger.debug(f"FALL DETECTION error cam {camera.id}: {e}")
 
             if frames % 300 == 0:
                 prune_last_log()
@@ -1464,21 +1505,31 @@ def _print_summary(cam_id: int, state: CameraAIState):
 # Fall Detection Functions
 # ===========================================================================
 
-def _init_fall_detector():
-    """Initialize global fall detector."""
+def init_fall_detector():
+    """Initialize global fall detector with all config parameters."""
     global fall_detector
     if fall_detector is None and FALL_DETECTION_ENABLED:
         fall_detector = FallDetector(
             angle_threshold=FALL_ANGLE_THRESHOLD,
             duration_threshold=FALL_DURATION_THRESHOLD,
             confidence_threshold=FALL_CONFIDENCE_THRESHOLD,
+            descent_velocity_threshold=FALL_DESCENT_VELOCITY,
+            min_person_height=FALL_MIN_PERSON_HEIGHT,
             enabled=True
         )
-        logger.info(f"Fall detector initialized: angle={FALL_ANGLE_THRESHOLD}°, duration={FALL_DURATION_THRESHOLD}s")
+        logger.info(
+            f"Fall detector initialized: angle={FALL_ANGLE_THRESHOLD}°, "
+            f"duration={FALL_DURATION_THRESHOLD}s, descent_vel={FALL_DESCENT_VELOCITY}, "
+            f"conf={FALL_CONFIDENCE_THRESHOLD}, interval={FALL_DETECTION_INTERVAL}s"
+        )
 
 
 def _analyze_fall_detection(state: CameraAIState, frame: np.ndarray, now: float):
-    """Analyze frame for fall detection."""
+    """Analyze frame for fall detection using shared fall_detector.
+
+    Uses the camera's state for motion gating so pose estimation only runs
+    when there is meaningful activity in the frame.
+    """
     global fall_detector, fall_alert_cooldown
 
     if fall_detector is None:
@@ -1503,13 +1554,22 @@ def _analyze_fall_detection(state: CameraAIState, frame: np.ndarray, now: float)
         landmarks = fall_detector.detect_pose(frame)
 
         if landmarks is not None:
-            events = fall_detector.update(landmarks, h, w)
+            # Pass timestamp to fall_detector for accurate velocity calculation
+            events = fall_detector.update(landmarks, h, w, timestamp=now)
 
             for event in events:
-                if event.get("type") == "fall":
-                    logger.warning(f"[FALL] Camera {cam_id}: {event}")
+                event_type = event.get("type", "")
+                if event_type in ("fall", "fall_warning"):
+                    severity = event.get("severity", "critical")
+                    logger.warning(
+                        f"[FALL][{severity.upper()}] Camera {cam_id}: "
+                        f"type={event_type} angle={event.get('body_angle', 0)}° "
+                        f"vel_y={event.get('velocity_y', 0)} dur={event.get('fallen_duration', 0)}s "
+                        f"confidence={event.get('confidence', 0)}"
+                    )
                     _emit_emergency_event(cam_id, frame, event)
-                    fall_alert_cooldown[cam_id] = now
+                    if event_type == "fall":
+                        fall_alert_cooldown[cam_id] = now
 
     except Exception as e:
         logger.debug(f"Fall detection error for camera {cam_id}: {e}")
@@ -1705,10 +1765,10 @@ async def lifespan(app: FastAPI):
     init_face_models()
     load_employee_embeddings()
 
-    # Initialize Fall Detector
+    # Initialize Fall Detector (runs on ALL cameras, not just recognition cameras)
     if FALL_DETECTION_ENABLED:
-        _init_fall_detector()
-        logger.info("Fall detection enabled")
+        init_fall_detector()
+        logger.info("Fall detection enabled on all cameras")
 
     # Recognition worker (embedding / snapshot / logging off the frame loop)
     recognition_thread = threading.Thread(target=recognition_worker, daemon=True)
@@ -1776,6 +1836,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(playback_router)
 
 
 # API Endpoints
