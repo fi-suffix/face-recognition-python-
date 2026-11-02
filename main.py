@@ -1,7 +1,9 @@
 import os
+import asyncio
 import math
 import uuid
 import collections
+import concurrent.futures
 import urllib.request
 import cv2
 import numpy as np
@@ -15,7 +17,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, HttpUrl
@@ -37,6 +39,8 @@ CAMERA_RECONNECT_INTERVAL = int(os.getenv("CAMERA_RECONNECT_INTERVAL", "5"))
 LOG_COOLDOWN = float(os.getenv("LOG_COOLDOWN", "3"))
 # Minimum seconds between recognition passes per face track (keeps the video fluid)
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "2.0"))
+# Legacy video-loop recognition gate (recognition cameras use the v2 pipeline)
+RECOGNITION_EVERY_N_FRAMES = int(os.getenv("RECOGNITION_EVERY_N_FRAMES", "2"))
 # Stream width & fps proven on the field laptop (5 cameras, ~60% CPU)
 MAX_STREAM_WIDTH = int(os.getenv("MAX_STREAM_WIDTH", "640"))
 STREAM_FPS = int(os.getenv("STREAM_FPS", "10"))
@@ -56,6 +60,8 @@ RTSP_READ_TIMEOUT_MS = int(os.getenv("RTSP_READ_TIMEOUT_MS", "10000"))
 DETECT_ENHANCE = os.getenv("DETECT_ENHANCE", "1") == "1"
 # Wajah lebih kecil dari ini (px, di lebar stream) tidak di-recognisi/di-log (buang noise)
 MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", "24"))
+# Lebar minimum wajah (px, pada frame deteksi) agar noise burik tidak ikut dianggap wajah
+MIN_FACE_WIDTH = int(os.getenv("MIN_FACE_WIDTH", "20"))
 # Maksimal wajah yang diproses recognition per jendela gate (ambil yang terbesar)
 RECOGNITION_MAX_FACES = int(os.getenv("RECOGNITION_MAX_FACES", "2"))
 
@@ -64,6 +70,8 @@ RECOGNITION_MAX_FACES = int(os.getenv("RECOGNITION_MAX_FACES", "2"))
 LARAVEL_INTERNAL_TOKEN = os.getenv("LARAVEL_INTERNAL_TOKEN", "")
 EVENT_EMIT_ENABLED = os.getenv("EVENT_EMIT_ENABLED", "1") == "1"
 EVENT_EMIT_RETRIES = int(os.getenv("EVENT_EMIT_RETRIES", "3"))
+# Recompute SFace embeddings on startup (one-off migration flag)
+RECOMPUTE_EMBEDDINGS_ON_START = (os.getenv("RECOMPUTE_EMBEDDINGS_ON_START", "false").lower() in ("1", "true", "yes"))
 
 # --- Phase 2: cheap recognition pipeline (per-camera, recognition_enabled only) ---
 USE_GO2RTC_SOURCE = os.getenv("USE_GO2RTC_SOURCE", "0") == "1"
@@ -89,10 +97,12 @@ TRACK_MAX_AGE = float(os.getenv("TRACK_MAX_AGE", "2.0"))
 
 # --- Fall Detection Configuration ---
 FALL_DETECTION_ENABLED = os.getenv("FALL_DETECTION_ENABLED", "1") == "1"
-FALL_DETECTION_INTERVAL = float(os.getenv("FALL_DETECTION_INTERVAL", "1.0"))
-FALL_ANGLE_THRESHOLD = float(os.getenv("FALL_ANGLE_THRESHOLD", "45"))
-FALL_DURATION_THRESHOLD = float(os.getenv("FALL_DURATION_THRESHOLD", "3.0"))
-FALL_CONFIDENCE_THRESHOLD = float(os.getenv("FALL_CONFIDENCE_THRESHOLD", "0.5"))
+FALL_DETECTION_INTERVAL = float(os.getenv("FALL_DETECTION_INTERVAL", "0.3"))  # was 1.0, now 0.3s for faster detection
+FALL_ANGLE_THRESHOLD = float(os.getenv("FALL_ANGLE_THRESHOLD", "60"))       # was 45, widened to 60 for sitting+lying
+FALL_DURATION_THRESHOLD = float(os.getenv("FALL_DURATION_THRESHOLD", "1.5")) # was 3.0, now 1.5s
+FALL_CONFIDENCE_THRESHOLD = float(os.getenv("FALL_CONFIDENCE_THRESHOLD", "0.45"))
+FALL_DESCENT_VELOCITY = float(os.getenv("FALL_DESCENT_VELOCITY", "0.08"))  # NEW: normalized velocity threshold
+FALL_MIN_PERSON_HEIGHT = float(os.getenv("FALL_MIN_PERSON_HEIGHT", "0.12")) # NEW: min person height in frame
 ALERT_SOUND_ENABLED = os.getenv("ALERT_SOUND_ENABLED", "1") == "1"
 ALERT_SOUND_PATH = os.getenv("ALERT_SOUND_PATH", "")
 ALERT_REPEAT_COUNT = int(os.getenv("ALERT_REPEAT_COUNT", "3"))
@@ -100,6 +110,7 @@ ALERT_REPEAT_COUNT = int(os.getenv("ALERT_REPEAT_COUNT", "3"))
 # Import fall detection modules
 from fall_detector import FallDetector, FallState
 from alert_sound import play_emergency_alert
+from playback_service import playback_router
 
 # Model files (OpenCV Zoo YuNet + SFace)
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -686,12 +697,10 @@ def prune_tracks(camera_id: int, t: float, max_age_ms: float = 5000.0, max_items
     camera_tracks[camera_id] = alive
 
 def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
-    """Process camera stream in background.
+    """Process camera stream in background (video-only, no face recognition).
 
-    The capture loop reads + downscales + encodes frames at a capped fps. Face
-    detection runs time-gated on a small frame, and recognition (SFace + snapshot
-    + Laravel log) is off-loaded to the worker pool. Nothing here copies the full
-    frame per detected face, so a walking person no longer starves the loop.
+    Also runs fall detection via the shared global fall_detector so non-recognition
+    cameras still get fall alerts.
     """
     logger.info(f"Starting stream processing for camera {camera.id}: {camera.name}")
 
@@ -714,14 +723,19 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
     reconnect_attempts = 0
     max_reconnect_attempts = 10
     frames = 0
-    loop_dt = 1.0 / max(1, LOOP_FPS)
-    last_detect_ts = 0.0
+    last_scale = 1.0
+    last_recognition = 0.0
+    detect_frame_counter = 0
     cached_faces = []
     read_interval = 1.0 / STREAM_FPS
     last_read_time = 0.0
 
+    # Fall detection timing for non-recognition cameras
+    last_fall_check = 0.0
+    fall_check_interval = FALL_DETECTION_INTERVAL
+    cam_fall_cooldown = 0.0
+
     while camera_streams.get(camera.id, {}).get("running", False) and not stop_event.is_set():
-        loop_start = time.time()
         try:
             if cap is None or not cap.isOpened():
                 if reconnect_attempts >= max_reconnect_attempts:
@@ -737,7 +751,7 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                     cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
                     cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
 
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
                 reconnect_attempts += 1
 
                 if not cap.isOpened():
@@ -748,7 +762,15 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 reconnect_attempts = 0
                 logger.info(f"Camera {camera.id} connected successfully")
 
+            # Throttle read ke STREAM_FPS agar CPU tidak decode semua frame kamera
+            elapsed = now_ms() - last_read_time
+            wait = read_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+
             ret, frame = cap.read()
+            if ret:
+                last_read_time = now_ms()
             if not ret:
                 logger.warning(f"Failed to read frame from camera {camera.id}")
                 cap.release()
@@ -758,15 +780,15 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
 
             frames += 1
 
-            # Downscale large frames for cheaper streaming (tiered)
+            # Downscale large frames for cheaper detection + streaming (tiered)
             h, w = frame.shape[:2]
             if w > MAX_STREAM_WIDTH:
-                scale = MAX_STREAM_WIDTH / float(w)
-                new_h = int(h * scale)
+                last_scale = MAX_STREAM_WIDTH / float(w)
+                new_h = int(h * last_scale)
                 frame = cv2.resize(frame, (MAX_STREAM_WIDTH, new_h), interpolation=cv2.INTER_AREA)
-            elif w > 640:
-                scale = 640.0 / float(w)
-                new_h = int(h * scale)
+            elif w > 640:  # Second tier: downscale to 640 for detection
+                last_scale = 640.0 / float(w)
+                new_h = int(h * last_scale)
                 frame = cv2.resize(frame, (640, new_h), interpolation=cv2.INTER_AREA)
             else:
                 last_scale = 1.0
@@ -800,10 +822,8 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                     rec_frame = frame.copy()
                     last_recognition = t
 
-            for (x, y, w, h) in faces:
-                face_img = crop_face(frame, x, y, w, h)
-                if face_img.size == 0:
-                    continue
+            for face in faces:
+                x, y, w, h = int(face[0]), int(face[1]), int(face[2]), int(face[3])
 
                 # Reuse the latest recognition result for this face (approx by position)
                 emp_id, confidence = None, 0.0
@@ -832,33 +852,49 @@ def process_camera_stream(camera: CameraConfig, stop_event: threading.Event):
                 status = "recognized" if emp_id else "unknown"
                 emp_data = employee_data_cache.get(emp_id, {}) if emp_id else {}
                 name = emp_data.get("name", "")
-                status = "recognized" if emp_id else "unknown"
                 color = (0, 255, 0) if status == "recognized" else (0, 0, 255)
                 label = f"{name or 'Unknown'} ({confidence:.2f})"
-                cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), color, 2)
-                cv2.putText(frame, label, (dx, max(20, dy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(frame, label, (x, max(20, y-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Off-load recognition (SFace + snapshot + Laravel log) to the workers.
-            # Only the small detection frame is copied, once per detection pass.
-            if frames_due and face_recognizer is not None:
-                try:
-                    recognition_queue.put_nowait((camera.id, det_frame.copy(), frames_due))
-                except queue.Full:
-                    logger.warning(f"Recognition queue full for camera {camera.id}, dropping batch")
-
-            # Store cached JPEG for MJPEG streaming / snapshot polling
+            # Store cached JPEG for MJPEG streaming (encode once, serve many clients)
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ok:
                 camera_streams[camera.id]["latest_jpg"] = buf.tobytes()
+            camera_streams[camera.id]["latest_frame"] = frame
             camera_streams[camera.id]["last_update"] = now_ms()
 
-            if frames % 200 == 0:
-                prune_last_log()
-                prune_tracks(camera.id, now_ms())
+            # --- Fall Detection for non-recognition cameras ---
+            # Run pose estimation at FALL_DETECTION_INTERVAL to avoid CPU overload
+            if FALL_DETECTION_ENABLED and fall_detector is not None:
+                now_fall = time.perf_counter()
+                if (now_fall - last_fall_check) >= fall_check_interval:
+                    last_fall_check = now_fall
+                    if (now_fall - cam_fall_cooldown) >= FALL_ALERT_COOLDOWN_SECONDS:
+                        try:
+                            h, w = frame.shape[:2]
+                            landmarks = fall_detector.detect_pose(frame)
+                            if landmarks is not None:
+                                events = fall_detector.update(landmarks, h, w, timestamp=now_fall)
+                                for event in events:
+                                    event_type = event.get("type", "")
+                                    if event_type in ("fall", "fall_warning"):
+                                        severity = event.get("severity", "critical")
+                                        logger.warning(
+                                            f"[FALL][{severity.upper()}] Camera {camera.id}: "
+                                            f"type={event_type} angle={event.get('body_angle', 0)}° "
+                                            f"vel_y={event.get('velocity_y', 0)} "
+                                            f"dur={event.get('fallen_duration', 0)}s "
+                                            f"confidence={event.get('confidence', 0)}"
+                                        )
+                                        _emit_emergency_event(camera.id, frame, event)
+                                        if event_type == "fall":
+                                            cam_fall_cooldown = now_fall
+                        except Exception as e:
+                            logger.debug(f"FALL DETECTION error cam {camera.id}: {e}")
 
-            elapsed = time.time() - loop_start
-            if elapsed < loop_dt:
-                time.sleep(loop_dt - elapsed)
+            if frames % 300 == 0:
+                prune_last_log()
 
         except Exception as e:
             logger.error(f"Error processing camera {camera.id}: {e}")
@@ -1565,21 +1601,31 @@ def _print_summary(cam_id: int, state: CameraAIState):
 # Fall Detection Functions
 # ===========================================================================
 
-def _init_fall_detector():
-    """Initialize global fall detector."""
+def init_fall_detector():
+    """Initialize global fall detector with all config parameters."""
     global fall_detector
     if fall_detector is None and FALL_DETECTION_ENABLED:
         fall_detector = FallDetector(
             angle_threshold=FALL_ANGLE_THRESHOLD,
             duration_threshold=FALL_DURATION_THRESHOLD,
             confidence_threshold=FALL_CONFIDENCE_THRESHOLD,
+            descent_velocity_threshold=FALL_DESCENT_VELOCITY,
+            min_person_height=FALL_MIN_PERSON_HEIGHT,
             enabled=True
         )
-        logger.info(f"Fall detector initialized: angle={FALL_ANGLE_THRESHOLD}°, duration={FALL_DURATION_THRESHOLD}s")
+        logger.info(
+            f"Fall detector initialized: angle={FALL_ANGLE_THRESHOLD}°, "
+            f"duration={FALL_DURATION_THRESHOLD}s, descent_vel={FALL_DESCENT_VELOCITY}, "
+            f"conf={FALL_CONFIDENCE_THRESHOLD}, interval={FALL_DETECTION_INTERVAL}s"
+        )
 
 
 def _analyze_fall_detection(state: CameraAIState, frame: np.ndarray, now: float):
-    """Analyze frame for fall detection."""
+    """Analyze frame for fall detection using shared fall_detector.
+
+    Uses the camera's state for motion gating so pose estimation only runs
+    when there is meaningful activity in the frame.
+    """
     global fall_detector, fall_alert_cooldown
 
     if fall_detector is None:
@@ -1604,13 +1650,22 @@ def _analyze_fall_detection(state: CameraAIState, frame: np.ndarray, now: float)
         landmarks = fall_detector.detect_pose(frame)
 
         if landmarks is not None:
-            events = fall_detector.update(landmarks, h, w)
+            # Pass timestamp to fall_detector for accurate velocity calculation
+            events = fall_detector.update(landmarks, h, w, timestamp=now)
 
             for event in events:
-                if event.get("type") == "fall":
-                    logger.warning(f"[FALL] Camera {cam_id}: {event}")
+                event_type = event.get("type", "")
+                if event_type in ("fall", "fall_warning"):
+                    severity = event.get("severity", "critical")
+                    logger.warning(
+                        f"[FALL][{severity.upper()}] Camera {cam_id}: "
+                        f"type={event_type} angle={event.get('body_angle', 0)}° "
+                        f"vel_y={event.get('velocity_y', 0)} dur={event.get('fallen_duration', 0)}s "
+                        f"confidence={event.get('confidence', 0)}"
+                    )
                     _emit_emergency_event(cam_id, frame, event)
-                    fall_alert_cooldown[cam_id] = now
+                    if event_type == "fall":
+                        fall_alert_cooldown[cam_id] = now
 
     except Exception as e:
         logger.debug(f"Fall detection error for camera {cam_id}: {e}")
@@ -1806,10 +1861,10 @@ async def lifespan(app: FastAPI):
     init_face_models()
     load_employee_embeddings()
 
-    # Initialize Fall Detector
+    # Initialize Fall Detector (runs on ALL cameras, not just recognition cameras)
     if FALL_DETECTION_ENABLED:
-        _init_fall_detector()
-        logger.info("Fall detection enabled")
+        init_fall_detector()
+        logger.info("Fall detection enabled on all cameras")
 
     # Recognition worker (embedding / snapshot / logging off the frame loop)
     recognition_thread = threading.Thread(target=recognition_worker, daemon=True)
@@ -1878,6 +1933,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(playback_router)
+
 
 # API Endpoints
 @app.get("/health")
@@ -1933,19 +1990,32 @@ async def stop_camera(camera_id: int):
 
 
 @app.get("/cameras/{camera_id}/stream")
-async def camera_stream(camera_id: int):
-    """MJPEG stream for live monitoring (serves cached JPEG frames)"""
+async def camera_stream(
+    camera_id: int,
+    request: Request,
+    fps: Optional[float] = Query(default=None, ge=0.5),
+):
+    """MJPEG stream for live monitoring (serves cached JPEG frames).
+
+    Async generator + request.is_disconnected(): penonton berhenti seketika
+    saat koneksi putus (tanpa menahan thread anio), dan query ?fps= dihormati
+    (dibatasi maksimum STREAM_FPS) untuk menghemat CPU peramban/praprasa.
+    """
     if camera_id not in camera_streams:
         raise HTTPException(status_code=404, detail="Camera not running")
 
-    def generate_frames():
-        frame_interval = 1.0 / STREAM_FPS
+    rate = STREAM_FPS if fps is None else max(0.5, min(float(fps), float(STREAM_FPS)))
+    frame_interval = 1.0 / rate
+
+    async def generate_frames():
         while camera_streams.get(camera_id, {}).get("running", False):
+            if await request.is_disconnected():
+                break
             jpg = camera_streams[camera_id].get("latest_jpg")
             if jpg is not None:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n')
-            time.sleep(frame_interval)
+            await asyncio.sleep(frame_interval)
 
     return StreamingResponse(
         generate_frames(),
